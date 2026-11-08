@@ -319,14 +319,12 @@ class ConfiguredAgentLineTests(unittest.TestCase):
         self.assertIn('worker model', text)
         self.assertNotIn('same provider', text)
 
-    def test_level_rows_fold_into_one_while_the_agent_panel_lists_agents(self):
+    def test_level_rows_fold_into_one_compact_line(self):
         profiles = {'easy': {'provider': 'official', 'model': 'claude-haiku-5-5'},
                     'mid': {'provider': 'official', 'model': 'claude-sonnet-5-5'}}
-        with patch.object(statusline.time, 'time', return_value=1000.0):
-            open_panel = self.render('official', profiles, stored={'panel-s1.json': {'at': 995.0, 'rows': 3}})
-            stale = self.render('official', profiles, stored={'panel-s1.json': {'at': 900.0, 'rows': 3}})
-        self.assertEqual(open_panel.splitlines()[-1], '↳ easy haiku ●●● · mid sonnet ●●●')
-        self.assertEqual(stale.count('no runs yet'), 2)  # a panel not refreshed for 15 s is closed
+        text = self.render('official', profiles)
+        self.assertEqual(text.splitlines()[-1], '↳ easy haiku ●●● · mid sonnet ●●●')
+        self.assertNotIn('no runs yet', text)
 
     def test_configured_worker_line_has_short_labels_and_keeps_quota_bars(self):
         text = self.render('official', {'sub': {'provider': 'openai-oauth', 'model': 'gpt-6.1-sol', 'effort': 'xhigh'}})

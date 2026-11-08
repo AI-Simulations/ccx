@@ -1116,11 +1116,9 @@ def render(d):
         rows.update({n: every[n] for n, used in sub_costs.items() if n not in rows and isinstance(every.get(n), dict)
                      and now - (used.get("at") or 0) < 600})
         ranges = level_ranges(rows)
-        # Claude's agent panel sits below these rows and is cut off at the screen's bottom edge: while it lists
-        # agents (ccx-switch refreshes this every 5 s), the level rows fold into one so the panel fits.
-        panels = [load_json(f"panel-{key}.json") for key in
-                  {d.get("session_id"), os.path.splitext(os.path.basename(d.get("transcript_path") or ""))[0]} if key]
-        folded = [] if any((p.get("rows") or 0) > 0 and now - (p.get("at") or 0) < 15 for p in panels) else None
+        # Several worker rows fold into one compact line ("v-easy haiku ●● · mid sonnet ●●● $100"), so
+        # Claude's own agent panel below keeps its room; a lone profile keeps its detailed row.
+        folded = [] if len(rows) > 1 else None
         order = lambda kv: ROUTER_LEVELS.index(kv[0]) if kv[0] in ROUTER_LEVELS else len(ROUTER_LEVELS)
         for name, profile in sorted(rows.items(), key=order):  # levels easy to hard, other profiles after
             idle = name not in offered
@@ -1153,7 +1151,8 @@ def render(d):
                 # shortest form that still tells the levels apart: "v-easy haiku · mid sonnet $100"
                 short = name.replace("very-", "v-")
                 folded.append(f"{DIM if not used.get('ctx') else ''}{short} {rgb(hue, 0.45, 0.9 if active else 0.6)}{target.split()[0]}{RESET} {dots}"
-                              + (f" {DIM}{money(used['usd'])}{RESET}" if used.get("priced") else ""))
+                              + (f" {DIM}{money(used['usd'])}{RESET}" if used.get("priced") else "")
+                              + (f" {YELLOW}↪{RESET}" if name in moved else ""))
                 continue
             seg = [f"{head} {rgb(hue, 0.45, 0.9 if active else 0.6)}{target}{RESET} {dots}{'' if used.get('ctx') else ac}{route}"
                    + (f" {YELLOW}↪ fallback active{RESET}" if name in moved else "")]

@@ -694,9 +694,3 @@ with tempfile.TemporaryDirectory() as _d, patch.object(ccx, 'presets_path', retu
         with patch.object(ccx, 'preset_menu', side_effect=['manual', ccx.catalog.MenuBack]):
             ccx.main()
 print('preset launch menu ok')
-
-
-def test_agent_statusline_numbers_rows_so_clipped_ones_show():
-    rows = list(ccx.agent_statusline({"tasks": [{"id": "a", "model": "x", "description": "one"}, {"bad": 1},
-                                                {"id": "b", "model": "y", "description": "two"}], "columns": 80}))
-    assert [r["content"] for r in rows] == ["1/2 x · one", "2/2 y · two"]

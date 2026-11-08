@@ -307,7 +307,7 @@ class AgentRoutingTests(unittest.TestCase):
             self.assertEqual([g['matcher'] for g in first['hooks']['SubagentStop']], ['^ccx-.*'])
             self.assertEqual(first['env']['CLAUDE_CODE_PLUGIN_DIRS'].split(os.pathsep),
                              ['/mods/keep', (root / 'ccx' / 'subagent-picker').resolve().as_posix()])
-            self.assertIn('agent-statusline', first['subagentStatusLine']['command'])
+            self.assertNotIn('subagentStatusLine', first)
             self.assertEqual(first['statusLine']['refreshInterval'], 60)
             self.assertEqual((claude / 'statusline.py').read_bytes(), (ROOT / 'statusline.py').read_bytes())
             self.assertTrue(list((root / 'ccx').glob('backup-resume-*/claude/settings.json')))
@@ -415,17 +415,6 @@ class AgentRoutingTests(unittest.TestCase):
         self.assertIn('x-ccx-worker-profile: sub', headers, 'the adapter retags live effort per request')
         self.assertIn('x-ccx-launch: agent-sub', headers, "the adapter resolves this worker's fallback by launch id")
 
-    def test_removed_profile_does_not_hide_running_worker_snapshot(self):
-        payload = {'transcript_path': str(ROOT / 'session.jsonl'), 'tasks': [
-            {'id': 'old', 'agentType': 'ccx-sub', 'model': 'native-relay', 'status': 'running'}]}
-        saved = {**self.PROFILES['sub'], 'profile': 'sub', 'session_id': SESSION}
-        with patch.object(ccx, 'load_agents', return_value={}), \
-             patch.object(ccx, '_recorded_context', return_value=saved):
-            row = list(ccx.agent_statusline(payload))[0]['content']
-        self.assertIn('gpt-test', row)
-        self.assertNotIn('relay', row)
-        self.assertTrue(row.startswith('\x1b[1;97m'), 'a running row is highlighted')
-
     def hook(self, command, payload, profiles=None, child=False, resume_type=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -503,16 +492,6 @@ class AgentRoutingTests(unittest.TestCase):
             self.assertEqual(result['hookEventName'], event)
             self.assertIn('ccx-sub', result['additionalContext'])
             self.assertIn('openai-oauth/gpt-test', result['additionalContext'])
-
-    def test_native_rows_are_not_relabelled_after_profiles_change(self):
-        payload = {'columns': 160, 'tasks': [
-            {'id': 'old', 'agentType': 'fork', 'model': 'claude-opus-5-5', 'description': 'old work', 'status': 'running'},
-            {'id': 'ccx', 'agentType': 'ccx-sub', 'model': 'claude-haiku-test', 'description': 'new work', 'status': 'running'}]}
-        rows = [json.loads(line) for line in self.hook('agent-statusline', payload).splitlines()]
-        self.assertIn('claude-opus-5-5', rows[0]['content'])
-        self.assertNotIn('gpt-test', rows[0]['content'])
-        self.assertIn('gpt-test · new work', rows[1]['content'])
-        self.assertNotIn('claude-haiku-test', rows[1]['content'], 'the relay model is not the worker')
 
     def test_worker_marks_child_to_prevent_recursive_routing(self):
         with patch.object(ccx, 'load_agents', return_value=self.PROFILES), \

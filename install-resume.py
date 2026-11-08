@@ -124,7 +124,9 @@ def install(target, profiles, commands=None, claude=None):
             groups.append(group)
         settings.setdefault('statusLine', {}).update(
             type='command', command=PYTHON + ' -B "' + (claude / 'statusline.py').as_posix() + '"')
-        settings['subagentStatusLine'] = {'type': 'command', 'command': command + 'agent-statusline'}
+        # Claude Code draws its own agent panel rows; drop ccx's former override of them.
+        if 'agent-statusline' in str((settings.get('subagentStatusLine') or {}).get('command', '')):
+            del settings['subagentStatusLine']
         if (ROOT / PLUGIN).is_dir():
             env = settings.setdefault('env', {})
             plugin = (target / PLUGIN).as_posix()

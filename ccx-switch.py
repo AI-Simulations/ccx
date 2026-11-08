@@ -8,7 +8,7 @@
 # Only affects the current shell: env vars are applied by the shell's `ccx` function
 # sourcing apply.ps1 (PowerShell) or apply.sh (bash/zsh), since a child process cannot set them.
 
-# tempfile and urllib.request load where used: hooks and agent-statusline run often and never need them
+# tempfile and urllib.request load where used: hooks run often and never need them
 import contextlib, itertools, json, os, re, subprocess, sys, time, uuid
 from pathlib import Path
 
@@ -3582,167 +3582,16 @@ def hook_context(data):
             + ("\n\n" + orphans if orphans else "")}}
 
 
-def _worker_path(record):
-    """The external worker's transcript, or None."""
-    try:
-        uuid.UUID(record["session_id"])
-        return next(Path.home().joinpath(".claude", "projects").glob(f"*/{record['session_id']}.jsonl"))
-    except (StopIteration, ValueError, KeyError, TypeError, AttributeError):
-        return None
-
-
-def _worker_tokens(path):
-    """A worker's own token use, read from its transcript: a relay only counts its own."""
-    try:
-        seen, out, ctx, total, cached, usd, priced = set(), 0, 0, 0, 0, 0.0, False
-        try:
-            usage_cost = _statusline().usage_cost
-        except Exception:  # no price table: the row keeps its token counts
-            usage_cost = lambda model, usage: None
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                if '"usage"' not in line:
-                    continue
-                message = json.loads(line).get("message") or {}
-                usage = message.get("usage") or {}
-                if message.get("id") in seen or not usage:
-                    continue  # one message spans several transcript lines
-                seen.add(message.get("id"))
-                out += usage.get("output_tokens") or 0
-                sent = sum(usage.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
-                ctx = sent or ctx  # a synthetic closing message reports zero usage
-                total += sent  # every request resends the context: this is what the quota pays for
-                cached += usage.get("cache_read_input_tokens") or 0
-                cost = usage_cost(message.get("model"), usage)
-                if cost is not None:
-                    usd, priced = usd + cost, True
-    except (StopIteration, OSError, ValueError, KeyError, TypeError, AttributeError):
-        return ""
-    k = lambda n: f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1000:.1f}k" if n >= 1000 else str(n)
-    # Kept short for the panel: all tokens sent with their cache share, then the API cost.
-    money = (f" ${usd:,.2f}" if usd >= 1 else f" ${usd:.3f}") if priced else ""
-    return f"{k(total)}{money}" if seen else ""
-
-
-def _statusline():
-    """The sibling statusline.py, for its API price table (one copy of the prices)."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("ccx_statusline", Path(__file__).with_name("statusline.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _worker_now(path):
-    """What a worker is doing now: its latest tool call (a Bash call's own description first)
-    or the first line of its latest text, read from the transcript's tail."""
-    try:
-        with path.open("rb") as handle:
-            handle.seek(max(0, path.stat().st_size - 262144))
-            lines = handle.read().splitlines()
-    except (StopIteration, OSError, ValueError, KeyError, TypeError, AttributeError):
-        return ""
-    for line in reversed(lines):
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue  # the cut first line, or one still being written
-        content = (entry.get("message") or {}).get("content") if entry.get("type") == "assistant" else None
-        for block in reversed(content if isinstance(content, list) else []):
-            if block.get("type") == "tool_use" and block.get("name") != "SubagentHandback":  # the closing report, not work
-                args = block.get("input") if isinstance(block.get("input"), dict) else {}
-                if isinstance(args.get("description"), str) and args["description"].strip():
-                    return _feed_text(args["description"], 80)
-                return _feed_tool(block)[2:][:80]
-            if block.get("type") == "text" and (block.get("text") or "").strip():
-                return _feed_text(block["text"].strip().splitlines()[0], 80)
-    return ""
-
-
-# The agent panel rows stay as narrow as statusline.py's folded level row above them.
-PANEL_ROW_WIDTH = 82
-
-
-def _short_model(model):
-    """`claude-sonnet-5-5` -> `sonnet`; other providers' ids keep their last path part."""
-    model = str(model).rsplit("/", 1)[-1]
-    return re.sub(r"^claude-([a-z]+).*$", r"\1", model)
-
-
-def _note_panel(session, count):
-    """Tells statusline.py the agent panel is open, so it folds its level rows and the panel fits on screen."""
-    if not isinstance(session, str) or not re.fullmatch(r"[\w-]{8,80}", session):
-        return
-    try:
-        folder = Path.home() / ".claude" / "statusline"
-        folder.mkdir(parents=True, exist_ok=True)
-        (folder / f"panel-{session}.json").write_text(json.dumps({"at": time.time(), "rows": count}), encoding="utf-8")
-    except OSError:
-        pass
-
-
-def agent_statusline(data):
-    try:
-        profiles = load_agents()
-    except (Exception, SystemExit):
-        profiles = {}
-    columns = data.get("columns")
-    width = max(20, min(columns, 2000)) if type(columns) is int else 160
-    tasks = [t for t in data.get("tasks") or [] if isinstance(t, dict) and t.get("id")]
-    # A resumed session gets a new id but keeps its transcript: statusline.py looks under both.
-    for key in {data.get("session_id"), Path(str(data.get("transcript_path") or "")).stem}:
-        _note_panel(key, len(tasks))
-    for index, task in enumerate(tasks, 1):
-        kind = task.get("agentType") or "unknown"
-        live = isinstance(kind, str) and kind.startswith("ccx-") and kind.endswith("-live")
-        name = kind[4:-5] if live else kind[4:] if isinstance(kind, str) else ""
-        profile = profiles.get(name) if isinstance(kind, str) and kind.startswith("ccx-") else None
-        if isinstance(kind, str) and kind.startswith("ccx-"):
-            saved, path = {}, None
-            try:
-                own = _agent_files(data, task["id"]).with_suffix(".jsonl")
-                # an in-process worker's own transcript is the work; a relay's names the external one
-                path = own if live else None
-                saved = {} if live else _recorded_context(own)
-            except (ValueError, KeyError, TypeError):
-                pass
-            if saved and saved.get("profile") != name:
-                saved = {}
-            path = path or _worker_path(saved)
-            route = saved or profile
-            # Only what the row is for: the model doing the work, its usage, the task.
-            model = (route.get("model") or f"{route.get('provider', 'official')} default") if route else "route unavailable"
-            label = " ".join(filter(None, [_short_model(model), _worker_tokens(path) if path else ""]))
-            now = _worker_now(path) if path and task.get("status") == "running" else ""
-        else:
-            try:
-                tokens = _worker_tokens(_agent_files(data, task["id"]).with_suffix(".jsonl"))
-            except (ValueError, KeyError, TypeError):
-                tokens = ""
-            label, now = " ".join(filter(None, [_short_model(task.get("model") or "model pending"), tokens])), ""
-        label += f" · {task.get('description') or ''}" + (f" › {now}" if now else "")
-        # Claude's panel clips rows below the screen without saying so; `2/7` shows how many are hidden.
-        label = f"{index}/{len(tasks)} {label}"
-        label = re.sub(r"[\x00-\x1f\x7f]", " ", label)[:min(width, PANEL_ROW_WIDTH)]
-        if task.get("status") == "running":
-            label = f"\x1b[1;97m{label}\x1b[0m"  # Claude dims every row; a running one stands out
-        yield {"id": task["id"], "content": label}
-
-
 def main():
     global _STARTUP_LAUNCH
     args = sys.argv[1:]
-    if args[:1] in (["hook-agent"], ["hook-context"], ["hook-command"], ["hook-review"], ["agent-statusline"]):
+    if args[:1] in (["hook-agent"], ["hook-context"], ["hook-command"], ["hook-review"]):
         try:
             data = json.load(sys.stdin)
             if not isinstance(data, dict):
                 raise ValueError("hook input must be an object")
-            if args[0] == "agent-statusline":
-                for row in agent_statusline(data):
-                    print(json.dumps(row))
-            else:
-                handler = {"hook-agent": agent_hook, "hook-command": hook_command, "hook-review": review_hook}.get(args[0], hook_context)
-                print(json.dumps(handler(data)))
+            handler = {"hook-agent": agent_hook, "hook-command": hook_command, "hook-review": review_hook}.get(args[0], hook_context)
+            print(json.dumps(handler(data)))
         except (Exception, SystemExit):
             if args[0] == "hook-agent":
                 print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
