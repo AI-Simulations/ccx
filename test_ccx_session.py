@@ -75,6 +75,16 @@ class CcSessionTests(unittest.TestCase):
         self.assertFalse(self.ccx.subagents_off())
         self.assertEqual(self.ccx.load_agents()["sub"]["effort"], "low")
 
+    def test_context_is_resent_only_on_session_start_or_change(self):
+        self.ccx.CTX_SENT_DIR = str(Path(self.tmp.name) / "ctx-sent")
+        ctx = lambda ev: self.ccx.hook_context({"session_id": "sid-ctx", "hook_event_name": ev})
+        self.assertIn("additionalContext", ctx("SessionStart")["hookSpecificOutput"])
+        self.assertEqual(ctx("UserPromptSubmit"), {}, "an unchanged rule set is not repeated per prompt")
+        self.assertIn("additionalContext", ctx("SessionStart")["hookSpecificOutput"], "compaction/clear resends")
+        with patch("sys.stdout", new_callable=io.StringIO):
+            self.ccx.set_subagents_off(True)
+        self.assertIn("Subagents are off", ctx("UserPromptSubmit")["hookSpecificOutput"]["additionalContext"])
+
     def test_router_offers_levels_or_sub_per_session(self):
         levels = {n: {"provider": "official", "description": f"{n} tasks"} for n in ("easy", "mid", "hard")}
         Path(self.ccx.AGENTS_FILE).write_text(json.dumps({**self.global_agents, **levels}), encoding="utf-8")

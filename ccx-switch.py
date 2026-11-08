@@ -3543,6 +3543,34 @@ def review_hook(data):
     return {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": REVIEW_RULE}}
 
 
+CTX_SENT_DIR = os.path.join(CFG_DIR, "ctx-sent")
+
+
+def _context_once(data, text, orphans):
+    """Send the standing ccx rules at SessionStart (also after /clear and compaction) and on a prompt only
+    when they changed, so they are not re-added to the context on every message."""
+    sid = data.get("session_id")
+    if isinstance(sid, str) and re.fullmatch(r"[\w-]+", sid):
+        mark = os.path.join(CTX_SENT_DIR, sid)
+        try:
+            with open(mark, encoding="utf-8") as f:
+                same = f.read() == text
+        except OSError:
+            same = False
+        if same and data.get("hook_event_name") == "UserPromptSubmit":
+            text = ""
+        else:
+            try:
+                os.makedirs(CTX_SENT_DIR, exist_ok=True)
+                with open(mark, "w", encoding="utf-8") as f:
+                    f.write(text)
+            except OSError:
+                pass
+    text = "\n\n".join(t for t in (text, orphans) if t)
+    return {"hookSpecificOutput": {"hookEventName": data.get("hook_event_name", "UserPromptSubmit"),
+            "additionalContext": text}} if text else {}
+
+
 def hook_context(data):
     if os.environ.get("CCX_AGENT_CHILD") == "1":
         return {}
@@ -3550,10 +3578,8 @@ def hook_context(data):
         link_session(data["session_id"])
     orphans = deliver_orphans(data.get("session_id") or "") if isinstance(data.get("session_id"), str) else ""
     if subagents_off():
-        return {"hookSpecificOutput": {"hookEventName": data.get("hook_event_name", "UserPromptSubmit"),
-                "additionalContext": "Subagents are off for this session: do all work in the main session "
-                "with your own tools. Do not call Agent or Task; every such call is blocked."
-                + ("\n\n" + orphans if orphans else "")}}
+        return _context_once(data, "Subagents are off for this session: do all work in the main session "
+                             "with your own tools. Do not call Agent or Task; every such call is blocked.", orphans)
     profiles = offered_agents()
     choices = "; ".join(f"ccx-{name}: {agent_summary(a)}" + (f" ({a['description']})" if a.get("description") else "")
                         for name, a in profiles.items())
@@ -3574,12 +3600,10 @@ def hook_context(data):
     elif len(profiles) > 1:  # several profiles act as a router: the main model picks per task
         choices += (". Route each task to the cheapest profile whose description fits its difficulty; "
                     "split mixed work into separate calls")
-    return {"hookSpecificOutput": {"hookEventName": data.get("hook_event_name", "UserPromptSubmit"),
-            "additionalContext": "Delegate only through configured ccx subagents: " + (choices or "none configured") +
+    return _context_once(data, "Delegate only through configured ccx subagents: " + (choices or "none configured") +
             ". Native fork/general-purpose/custom worker calls are blocked. Use a ccx-* subagent_type and "
             "a self-contained task; ccx copies only the recent conversation and project memory. " + REVIEW_RULE + " To continue an old worker, "
-            "use a configured ccx-* type with its resume id; do not restart it as a native fork."
-            + ("\n\n" + orphans if orphans else "")}}
+            "use a configured ccx-* type with its resume id; do not restart it as a native fork.", orphans)
 
 
 def main():
