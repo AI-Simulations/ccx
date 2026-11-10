@@ -2,6 +2,7 @@
 import contextlib
 import importlib.util
 import io
+import itertools
 import json
 import os
 import re
@@ -647,6 +648,14 @@ with tempfile.TemporaryDirectory() as tmp:
         else:
             raise AssertionError('a picker that exited was reported as opened')
     assert 'stale failure' not in stderr.getvalue() and 'exited 1' in stderr.getvalue(), stderr.getvalue()
+    # A slow start (still running, no pid file yet) is a window on its way, not a failure: no second grid.
+    with patch.object(ccx, 'CFG_DIR', tmp), patch.object(ccx.subprocess, 'Popen') as popen, \
+            patch.object(ccx, 'gui_lock_path', return_value=str(Path(tmp, 'no-such.pid'))), \
+            patch.object(ccx.time, 'time', side_effect=itertools.count(0, 10)), \
+            contextlib.redirect_stdout(io.StringIO()) as stdout:
+        popen.return_value.poll.return_value = None
+        ccx.gui_command([])
+    assert 'Opened the model picker window' in stdout.getvalue(), stdout.getvalue()
     with patch.object(ccx, 'CFG_DIR', tmp), patch.object(ccx.subprocess, 'Popen') as popen:
         with contextlib.redirect_stderr(io.StringIO()):
             try:

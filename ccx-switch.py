@@ -1041,7 +1041,7 @@ def gui_command(words):
     # A detached child cannot report a Tk or startup failure through its exit code. The window
     # registers its pid first, so wait for that: the launcher then tells the mod the truth, and
     # the mod keeps its in-terminal grid when no window can open.
-    lock, deadline = gui_lock_path(), time.time() + 2.0
+    lock, deadline = gui_lock_path(), time.time() + 5.0
     while time.time() < deadline:
         if process_alive(gui_lock_pid(lock)):
             time.sleep(0.15)  # a Tk failure unlinks the lock and exits just after claiming it
@@ -1051,7 +1051,9 @@ def gui_command(words):
         if proc.poll() is not None:
             break
         time.sleep(0.05)
-    if process_alive(gui_lock_pid(lock)):
+    # A slow start (a busy PC, antivirus scanning python) is still a window on its way: a failure exits.
+    # Reporting it as missing made the mod open its in-terminal grid beside the window.
+    if proc.poll() is None or process_alive(gui_lock_pid(lock)):
         print(f"Opened the model picker window ({tab}).")
         return
     detail = ""
