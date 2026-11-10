@@ -1229,7 +1229,15 @@ def render(d):
 if __name__ == "__main__":
     # A hung render (stdin, network, file lock) must never outlive its refresh: Claude Code starts a new one every 2 s.
     import threading
-    watchdog = threading.Timer(30 if sys.argv[1:2] == ["--quota"] else 8, os._exit, (0,))
+    last = {}  # the session id once stdin is read; Claude Code blanks the status line on an empty run
+
+    def expire():
+        # a render past its budget reprints this session's last good line rather than leaving it blank
+        shown = load_json(f"last-{last['sid']}.json").get("line") if last.get("sid") else None
+        if shown:
+            print(shown, flush=True)
+        os._exit(0)
+    watchdog = threading.Timer(30 if sys.argv[1:2] == ["--quota"] else 8, expire)
     watchdog.daemon = True  # a normal render must not wait for it
     watchdog.start()
     if sys.argv[1:2] == ["--quota"]:
@@ -1247,8 +1255,12 @@ if __name__ == "__main__":
         data = json.loads(sys.stdin.read() or "{}")
     except ValueError:
         data = {}
+    sid = data.get("session_id") if isinstance(data, dict) else None
+    last["sid"] = sid if isinstance(sid, str) and sid.replace("-", "").isalnum() else None
     try:
         line = render(data if isinstance(data, dict) else {})
+        if last["sid"]:
+            save_json(f"last-{last['sid']}.json", {"line": line})
     except Exception:  # a broken status line is worse than a bare one
         line = str((data.get("model") or {}).get("id") if isinstance(data, dict) and isinstance(data.get("model"), dict) else "?")
     print(line)
