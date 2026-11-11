@@ -78,6 +78,8 @@ finished = subprocess.Popen([sys.executable, '-c', 'pass'],
                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 finished.wait()
 assert not gui.pid_alive(finished.pid), 'a reaped child still reads as alive'
+# raising looks only at the session's own process: another session's open picker is never brought forward
+assert not gui.raise_existing(finished.pid)
 
 print('ccx-gui pure parts ok')
 
@@ -370,10 +372,16 @@ class PickerTests(unittest.TestCase):
         tab.show_models((True, 'model-b\nmodel-a'))
         self.assertEqual(tab.chosen(), 'model-b')
 
-    def test_view_cache_prefers_the_saved_browsing_provider(self):
+    def test_provider_list_opens_on_official_not_the_last_browsed(self):
         self.tab.view = {'target': '', 'provider': 'alpha', 'picks': {'alpha': 'model-a'},
                          'sort': 'Listed', 'query': '', 'effort': 'default'}
-        self.tab.show_providers([('beta', 'Beta'), ('alpha', 'Alpha')])
+        with mock.patch.object(gui, 'run_ccx', return_value=(True, '')):
+            self.tab.show_providers([('beta', 'Beta'), ('official', 'Official'), ('alpha', 'Alpha')])
+        self.assertEqual(self.tab.provider.get(), 'official')
+
+    def test_provider_list_opens_on_the_route_in_use(self):
+        with mock.patch.object(gui, 'run_ccx', return_value=(True, 'Route: alpha/model-a')):
+            self.tab.show_providers([('official', 'Official'), ('alpha', 'Alpha')])
         self.assertEqual(self.tab.provider.get(), 'alpha')
 
     def test_view_cache_restores_the_saved_target(self):
@@ -626,8 +634,8 @@ class PickerTests(unittest.TestCase):
         self.assertEqual(self.run_ccx.call_count, 2)
 
     def test_editor_restricts_known_efforts_and_uses_actual_providers(self):
-        self.run_ccx.side_effect = lambda *args: (True, 'nvidia\tNVIDIA\nlmstudio\tLM Studio' if args == ('fallback', 'routes')
-                                                else 'commandcode\tCommand Code\ncommandcode-cli\tCommand Code CLI\nlmstudio\tLM Studio\nnvidia\tNVIDIA')
+        self.run_ccx.side_effect = lambda *args: (True, 'nvidia\tNVIDIA\ngpt4free\tFree' if args == ('fallback', 'routes')
+                                                else 'commandcode\tCommand Code\ncommandcode-cli\tCommand Code CLI\ngpt4free\tFree\nnvidia\tNVIDIA')
         editor = self.make_editor()
         fields = editor.fields['tools']
         fields['effort'].set('max')

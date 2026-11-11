@@ -1613,7 +1613,8 @@ def sync_claude_effort(model, effort):
 
 def set_route(launch, provider=None, model=None, effort=None):
     """Sets (or with no provider clears) this launch's provider/model override, and its effort."""
-    data = {k: v for k, v in load_routes().items() if time.time() - v.get("at", 0) < 86400}
+    # 30 days like fallbacks: a day dropped a still-open session's /model pick whenever another session routed
+    data = {k: v for k, v in load_routes().items() if time.time() - v.get("at", 0) < 30 * 86400}
     helpers = data.get(launch, {}).get("helpers")
     if provider:
         effort = effort or default_effort(provider, model)

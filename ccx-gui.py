@@ -1110,8 +1110,8 @@ class PickerTab(ttk.Frame):
         self.providers = rows
         self.provider_box.configure(values=[r[0] for r in rows])
         self.render_now()
-        wanted = (self.view.get('provider') if self.same_target() else '') or (
-            self.current[0] if self.current else '') or ''
+        # opens on the provider in use, else official (the user's default), never on the last one browsed
+        wanted = (self.current[0] if self.current else '') or 'official'
         choice = next((r[0] for r in rows if r[0] == wanted), rows[0][0] if rows else '')
         if not self.same_target() or choice != self.provider.get():
             # neither the old target's row nor the old provider's model is a pick for this one
@@ -2206,17 +2206,31 @@ def lock_file():
     return Path.home() / '.config/ccx' / f'gui-{safe}.pid'
 
 
-def raise_existing():
-    """Bring the already-open picker forward (Windows), best effort."""
+def raise_existing(pid):
+    """Bring this session's open picker (process pid) forward (Windows), best effort.
+    Every session's window shares one title, so a title lookup could raise another session's
+    picker, whose Apply then routes that other launch."""
     if os.name != 'nt':
         return False
     try:
         import ctypes
-        hwnd = ctypes.windll.user32.FindWindowW(None, 'ccx model picker')
-        if not hwnd:
+        user32, found = ctypes.windll.user32, []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def check(hwnd, _):
+            owner, title = ctypes.c_ulong(), ctypes.create_unicode_buffer(64)
+            user32.GetWindowThreadProcessId(ctypes.c_void_p(hwnd), ctypes.byref(owner))
+            user32.GetWindowTextW(ctypes.c_void_p(hwnd), title, 64)
+            if owner.value == pid and title.value == 'ccx model picker':
+                found.append(hwnd)
+                return False
+            return True
+
+        user32.EnumWindows(check, None)
+        if not found:
             return False
-        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        user32.ShowWindow(ctypes.c_void_p(found[0]), 9)  # SW_RESTORE
+        user32.SetForegroundWindow(ctypes.c_void_p(found[0]))
         return True
     except Exception:
         return False
@@ -2228,7 +2242,7 @@ def claim_window():
     try:
         pid = int(lock.read_text(encoding='utf-8').strip())
         if pid != os.getpid() and pid_alive(pid):
-            raise_existing()
+            raise_existing(pid)
             return False
     except (OSError, ValueError):
         pass

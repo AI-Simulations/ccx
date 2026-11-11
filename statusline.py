@@ -970,6 +970,19 @@ def mode_row(session_id, now):
     return " · ".join(parts)
 
 
+def quick_head(d):
+    """The model alone, from local files only: what a render that overruns its budget still prints."""
+    model = d.get("model") or {}
+    launch = os.environ.get("CCX_LAUNCH_ID")
+    route = (load_json(os.path.expanduser("~/.config/ccx/routes.json")) if launch else {}).get(launch) or {}
+    label = route["model"].rsplit("/", 1)[-1] if route.get("model") else model.get("display_name") or model.get("id")
+    if not label:
+        return None
+    label = re.sub(r'^claude-(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?$',
+                   lambda m: m[1].title() + ' ' + m[2] + ('.' + m[3] if m[3] else ''), label)
+    return f"{BOLD}{label}{RESET}"
+
+
 def render(d):
     model = d.get("model") or {}
     effort = d.get("effort")
@@ -1234,6 +1247,8 @@ if __name__ == "__main__":
     def expire():
         # a render past its budget reprints this session's last good line rather than leaving it blank
         shown = load_json(f"last-{last['sid']}.json").get("line") if last.get("sid") else None
+        # a brand-new session has no last line yet (a cold first render at startup): its model still shows
+        shown = shown or last.get("quick")
         if shown:
             print(shown, flush=True)
         os._exit(0)
@@ -1257,6 +1272,10 @@ if __name__ == "__main__":
         data = {}
     sid = data.get("session_id") if isinstance(data, dict) else None
     last["sid"] = sid if isinstance(sid, str) and sid.replace("-", "").isalnum() else None
+    try:
+        last["quick"] = quick_head(data if isinstance(data, dict) else {})
+    except Exception:
+        pass
     try:
         line = render(data if isinstance(data, dict) else {})
         if last["sid"]:

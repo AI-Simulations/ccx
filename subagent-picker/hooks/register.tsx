@@ -921,7 +921,6 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     void warm($).catch(() => undefined)
     // The session's API-price cost (main, subagents), drawn at the end of the mode row under the prompt.
-    $.ui.status(undefined)  // an earlier load pinned it as a status notice above the status line
     const showCost = async () => {
       const r = await py($, ['-B', '-c', RUN, COST, '--cost', await $.session.id()], { timeoutMs: 30000 })
       update($, cost, () => r.stdout.trim())

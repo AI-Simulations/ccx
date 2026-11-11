@@ -33,6 +33,15 @@ class WatchdogTests(unittest.TestCase):
             p.kill()
             p.stdin.close()
 
+    def test_quick_head_names_the_model_for_a_first_render(self):
+        # a new session's slow first render printed nothing: the watchdog had no last line to reprint
+        with patch.dict(os.environ, {"CCX_LAUNCH_ID": ""}):
+            line = statusline.quick_head({"model": {"id": "claude-opus-5-5"}})
+        self.assertIn("Opus 5.5", line)
+        with patch.dict(os.environ, {"CCX_LAUNCH_ID": "L1"}), \
+                patch.object(statusline, "load_json", return_value={"L1": {"provider": "openai-oauth", "model": "gpt-6.1-sol"}}):
+            self.assertIn("gpt-6.1-sol", statusline.quick_head({"model": {"id": "claude-opus-5-5"}}))
+
 
 class PlanValueTests(unittest.TestCase):
     def test_weekly_value_from_window_spend_and_share(self):
