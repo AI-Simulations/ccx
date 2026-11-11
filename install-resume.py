@@ -118,7 +118,7 @@ def install(target, profiles, commands=None, claude=None):
                 group['hooks'] = [h for h in group.get('hooks', []) if not (
                     re.search(r'ccx?-switch\.py', h.get('command', '')) and h.get('command', '').rstrip().endswith(entry))]
             groups[:] = [group for group in groups if group.get('hooks')]
-            group = {'hooks': [{'type': 'command', 'command': command + entry, 'timeout': 20}]}
+            group = {'hooks': [{'type': 'command', 'command': command + entry, 'timeout': 60}]}
             if matcher:
                 group['matcher'] = matcher
             groups.append(group)
