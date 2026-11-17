@@ -766,3 +766,31 @@ def test_ccx_switch_reloads_after_edit(tmp_path, monkeypatch):
         assert proxy._load_ccx_switch() is not first
     finally:
         proxy._ccx_switch = saved
+
+# `ccx official` reaches the adapter as HTTP_PROXY: full URLs for Anthropic's host, CONNECT tunnels for https.
+import http.client
+class Echo(BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def do_GET(self):
+        body = self.path.encode()
+        self.send_response(200); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+echo = ThreadingHTTPServer(("127.0.0.1", 0), Echo)
+adapter = ThreadingHTTPServer(("127.0.0.1", 0), proxy.Handler)
+for server in (echo, adapter):
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+saved_upstream, proxy.OFFICIAL_UPSTREAM = proxy.OFFICIAL_UPSTREAM, f"http://127.0.0.1:{echo.server_port}"
+try:
+    for target, expected in [("http://api.anthropic.com/official/v1/x?a=1", b"/v1/x?a=1"),
+                             (f"http://127.0.0.1:{echo.server_port}/other", b"/other")]:
+        conn = http.client.HTTPConnection("127.0.0.1", adapter.server_port, timeout=10)
+        conn.request("GET", target)
+        assert conn.getresponse().read() == expected, target
+    conn = http.client.HTTPConnection("127.0.0.1", adapter.server_port, timeout=10)
+    conn.set_tunnel("127.0.0.1", echo.server_port)
+    conn.request("GET", "/tunnelled")
+    assert conn.getresponse().read() == b"/tunnelled"
+    conn.close()
+finally:
+    proxy.OFFICIAL_UPSTREAM = saved_upstream
+    echo.shutdown(); adapter.shutdown()
+print("PASS: proxied official URL, plain-http relay, CONNECT tunnel")

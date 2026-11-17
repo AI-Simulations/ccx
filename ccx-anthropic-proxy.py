@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import queue
+import select
+import socket
 import subprocess
 import tempfile
 import urllib.error
@@ -42,12 +44,16 @@ DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h)")
 COOLDOWN = {}
 # Command Code's Go plan answers only its own CLI, so this route runs `cmdc -p` per request.
 CLI_ROUTE = "commandcode-cli"
-IDENTITY = {"service": "ccx-anthropic-proxy", "version": 35}
+IDENTITY = {"service": "ccx-anthropic-proxy", "version": 36}
 # `ccx official` (plain claude) comes in under this route: passed to Anthropic as sent, login and all,
 # until /model routes its launch to another provider.
 OFFICIAL_ROUTE = "official"
 OFFICIAL_UPSTREAM = "https://api.anthropic.com"
-HOP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "accept-encoding", "x-ccx-launch"}
+# `ccx official` sets ANTHROPIC_BASE_URL to this host (Claude Code keeps Code Mode only for it) and HTTP_PROXY
+# to the adapter, so its requests arrive here with the full URL.
+OFFICIAL_PROXIED = "http://api.anthropic.com"
+HOP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "accept-encoding", "x-ccx-launch",
+               "proxy-connection", "proxy-authorization"}
 # MiMo also closes with `</tool_call_<hash>>`, or not at all at the end of its reply.
 TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call[^>]*>|$)", re.S)
 XML_FUNCTION_RE = re.compile(r"<function=([^>\s]+)>(.*?)(?:</function>|$)", re.S)
@@ -1220,6 +1226,47 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(encoded)
 
+    def parse_request(self):
+        ok = super().parse_request()
+        if ok and self.path.startswith(OFFICIAL_PROXIED + "/"):
+            self.path = self.path[len(OFFICIAL_PROXIED):]
+        return ok
+
+    def relay_foreign(self, method):
+        """A program started inside a ccx session inherits HTTP_PROXY: its plain-http requests pass through."""
+        # shortcut: GET and POST only, add other methods when a tool needs them over plain http
+        if not self.path.startswith("http://"):
+            return False
+        length = int(self.headers.get("Content-Length") or 0)
+        self.forward_official(method, self.rfile.read(length) if length else None, url=self.path)
+        return True
+
+    def do_CONNECT(self):
+        """Claude Code's https traffic, which follows HTTP_PROXY here too: a blind tunnel, nothing read."""
+        host, _, port = self.path.rpartition(":")
+        try:
+            upstream = socket.create_connection((host.strip("[]"), int(port)), timeout=30)
+        except (OSError, ValueError):
+            self.send_error(502)
+            return
+        self.close_connection = True
+        with upstream:
+            try:
+                self.send_response(200, "Connection Established")
+                self.end_headers()
+                upstream.settimeout(None)
+                while True:
+                    ready = select.select([self.connection, upstream], [], [], 3600)[0]
+                    if not ready:
+                        return
+                    for source in ready:
+                        data = source.recv(65536)
+                        if not data:
+                            return
+                        (upstream if source is self.connection else self.connection).sendall(data)
+            except OSError:
+                pass
+
     def forward_live(self, live, body):
         """An in-process ccx subagent on an Anthropic-format provider: its /v1/messages with the profile's key."""
         headers = {k: v for k, v in self.headers.items() if k.lower() in ("anthropic-version", "accept")}
@@ -1274,6 +1321,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_GET(self):
+        if self.relay_foreign("GET"):
+            return
         refresh_upstreams()
         path = urllib.parse.urlsplit(self.path).path.strip("/").split("/")
         if path[0] == OFFICIAL_ROUTE:
@@ -1322,6 +1371,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, {"data": models, "has_more": False})
 
     def do_POST(self):
+        if self.relay_foreign("POST"):
+            return
         refresh_upstreams()
         streaming = False
         try:
@@ -1500,4 +1551,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if os.environ.get("HTTP_PROXY", "").endswith(f":{PORT}"):
+        del os.environ["HTTP_PROXY"]  # started from inside a ccx session: never proxy through itself
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

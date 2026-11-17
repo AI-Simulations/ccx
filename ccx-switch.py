@@ -63,6 +63,15 @@ OPENCODE_AUTH = os.path.expanduser(r"~\.local\share\opencode\auth.json")
 OPENCODE_CONFIG = os.path.join(os.path.expanduser("~"), ".config", "opencode", "opencode.jsonc")
 OAUTH_PORT = 10531
 ADAPTER_PORT = 10532
+ADAPTER_URL = f"http://127.0.0.1:{ADAPTER_PORT}"
+# `ccx official` through the adapter. The second form names Anthropic's own host and reaches the adapter as
+# HTTP_PROXY: Claude Code offers Code Mode only when ANTHROPIC_BASE_URL's host is api.anthropic.com.
+OFFICIAL_BASES = (ADAPTER_URL + "/official", "http://api.anthropic.com/official")
+PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+
+
+def via_adapter(url):
+    return url.startswith(ADAPTER_URL + "/") or url in OFFICIAL_BASES
 
 CCX_VARS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
            "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
@@ -1363,7 +1372,7 @@ def ensure_anthropic_proxy():
 
 def _ensure_anthropic_proxy():
     url = f"http://127.0.0.1:{ADAPTER_PORT}/health"
-    expected = {"service": "ccx-anthropic-proxy", "version": 35}  # unchanged: a bump restarts every session's adapter
+    expected = {"service": "ccx-anthropic-proxy", "version": 36}  # unchanged: a bump restarts every session's adapter
     try:
         running = fetch(url, timeout=1)
     except (OSError, ValueError):
@@ -1666,12 +1675,12 @@ def helper_command(words):
 def on_adapter():
     """This session reaches the adapter: an adapter route, or `ccx official` passed through it."""
     return (os.environ.get("CCX_MAIN_PROVIDER") in FALLBACK_ROUTES
-            or os.environ.get("ANTHROPIC_BASE_URL", "").endswith(f":{ADAPTER_PORT}/official"))
+            or os.environ.get("ANTHROPIC_BASE_URL", "") in OFFICIAL_BASES)
 
 
 def route_providers():
     """The providers the adapter can switch this session to; Claude itself only on a `ccx official` session."""
-    official = os.environ.get("ANTHROPIC_BASE_URL", "").endswith(f":{ADAPTER_PORT}/official")
+    official = os.environ.get("ANTHROPIC_BASE_URL", "") in OFFICIAL_BASES
     return [n for n in PROVIDERS if official or n != "official"]
 
 
@@ -1899,7 +1908,11 @@ def route_env(name, model_id, passthrough=False):
         if passthrough and os.environ.get("CCX_OFFICIAL_DIRECT") != "1":
             try:
                 ensure_anthropic_proxy()
-                env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{ADAPTER_PORT}/official"
+                env["ANTHROPIC_BASE_URL"] = OFFICIAL_BASES[0]
+                # A proxy of the user's own stays theirs; a ccx session's inherited adapter proxy is ours.
+                if all(os.environ.get(v, "") in ("", ADAPTER_URL) for v in PROXY_VARS):
+                    env.update(ANTHROPIC_BASE_URL=OFFICIAL_BASES[1], HTTP_PROXY=ADAPTER_URL,
+                               NO_PROXY=os.environ.get("NO_PROXY") or "localhost,127.0.0.1,::1")
                 # The adapter passes it to Anthropic, so Claude Code keeps its first-party behaviour
                 # (Haiku agent summaries, request classes); the adapter strips the extras on reroutes.
                 env["_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"] = "1"
@@ -1998,8 +2011,8 @@ def apply(name, model_id=None, no_run=False, claude_args=(), effort=None, autoco
     env["CLAUDE_CODE_FORK_SUBAGENT"] = "0"
     base = env.get("ANTHROPIC_BASE_URL", "")
     if not is_resume(claude_args):  # a resume takes its old session's settings back (link_session)
-        seed_launch_from_preset(name, launch, adapter=name in FALLBACK_ROUTES or base.endswith(f":{ADAPTER_PORT}/official"),
-                                providers=[n for n in PROVIDERS if n != "official" or base.endswith(f":{ADAPTER_PORT}/official")])
+        seed_launch_from_preset(name, launch, adapter=name in FALLBACK_ROUTES or base in OFFICIAL_BASES,
+                                providers=[n for n in PROVIDERS if n != "official" or base in OFFICIAL_BASES])
     if autocompact:
         claude_args = [*claude_args]
         compact_launch(env, claude_args, autocompact)
@@ -2804,7 +2817,7 @@ def run_agent(agent, prompt, opts=None, require_context=False):
     env = {k: v for k, v in os.environ.items()
            if k not in (*CCX_VARS, *OAI_VARS, "CLAUDECODE", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")}
     env.update({k: str(v) for k, v in route.items()})
-    if route.get("ANTHROPIC_BASE_URL", "").startswith(f"http://127.0.0.1:{ADAPTER_PORT}/"):
+    if via_adapter(route.get("ANTHROPIC_BASE_URL", "")):
         # The local adapter rereads this profile's effort per request, so effort changes reach running workers.
         env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(filter(None, [route.get("ANTHROPIC_CUSTOM_HEADERS"), f"x-ccx-worker-profile: {agent}", f"x-ccx-launch: agent-{agent}"]))
     env.update(CCX_AGENT_CHILD="1", CCX_WORKER_PROFILE=agent, CCX_MAIN_PROVIDER=name,
@@ -3399,7 +3412,7 @@ def _agent_decision(data):
                     return json.load(handle).get("agentType") == kind + "-live"
             except (OSError, ValueError, KeyError, TypeError):
                 return False
-        if (kind in {"ccx-" + name for name in profiles} and os.environ.get("ANTHROPIC_BASE_URL", "").startswith(f"http://127.0.0.1:{ADAPTER_PORT}/")
+        if (kind in {"ccx-" + name for name in profiles} and via_adapter(os.environ.get("ANTHROPIC_BASE_URL", ""))
                 and known_live() and (not original.get("resume") or resumes_live())):
             # Through the adapter the worker runs in-process (a full native tab); it starts from the task
             # prompt alone, without the copied conversation the relay gives an external worker.
@@ -3595,7 +3608,7 @@ def hook_context(data):
                     "into separate calls; when a worker's result fails your review, rerun that task once with a "
                     "score in the next range up before fixing it yourself")
         if (data.get("permission_mode") == "auto"
-                and os.environ.get("ANTHROPIC_BASE_URL", "").startswith(f"http://127.0.0.1:{ADAPTER_PORT}/")):
+                and via_adapter(os.environ.get("ANTHROPIC_BASE_URL", ""))):
             # auto mode denies a call the hook rewrites, and models often stop there: name the final type up front
             choices += (". Auto mode: name the in-process twin of the level that holds your score directly (for "
                         "\"[35] ...\" use ccx-easy-live, i.e. ccx-<level>-live); any other call is denied once and "

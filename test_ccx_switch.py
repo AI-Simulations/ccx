@@ -201,6 +201,7 @@ function claude {
         gateway = $env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY
         context = $env:CLAUDE_CODE_MAX_CONTEXT_TOKENS
         firstParty = $env:_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL
+        httpProxy = $env:HTTP_PROXY
         launchArgs = @($args)
     } | ConvertTo-Json -Compress
 }
@@ -224,7 +225,8 @@ function codex { $script:codexLaunched = $true; claude @args }
         assert not data['openai'] and not data['openaiBase']
         if provider == 'official':
             # the claude.ai login, passed through the adapter so /model can reroute it
-            assert data['base'] == f'http://127.0.0.1:{ccx.ADAPTER_PORT}/official'
+            # Anthropic's own host (Claude Code offers Code Mode only for it), reaching the adapter as HTTP_PROXY
+            assert (data['base'], data['httpProxy']) == ('http://api.anthropic.com/official', ccx.ADAPTER_URL)
             assert all(not data[k] for k in ['key', 'token', 'model', 'fable', 'sonnet', 'subagent'])
             assert data['launchArgs'] == []
         else:
