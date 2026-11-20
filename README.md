@@ -57,6 +57,7 @@ ccx status
 | `commandcode`, `minimax`, `opencode-*`, `openrouter` | Anthropic-format endpoint, direct; models the endpoint doesn't serve go through the adapter |
 | `openai-oauth`, `nvidia`, `gemini`, `ollama-cloud`, `lmstudio` | Local adapter on `127.0.0.1:10532` |
 | `commandcode-cli` | Adapter runs `cmdc` once per request (Command Code subscription, Go plan included) |
+| `antigravity-cli` | Adapter runs Google's Antigravity CLI (`agy`) once per request (Google AI Pro plan, text tool protocol) |
 | your own | OpenAI-format through the adapter, Anthropic-format direct (see below) |
 
 ### Custom providers

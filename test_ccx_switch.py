@@ -366,7 +366,8 @@ with tempfile.TemporaryDirectory(prefix='ccx-agents-check-') as directory:
     ccx.APPLY_FILE = str(temp / 'apply.ps1')
     for argv, expected in [(['ccx', '-NoRun', 'official', 'claude-opus-5-5', '--autocompact', '70'], "Set-Item 'Env:CLAUDE_AUTOCOMPACT_PCT_OVERRIDE' '70'"),
                            (['ccx', '-NoRun', 'official', 'claude-opus-5-5', '--autocompact=default'], "Remove-Item \"Env:CLAUDE_AUTOCOMPACT_PCT_OVERRIDE\"")]:
-        with patch.object(ccx.sys, 'argv', argv), contextlib.redirect_stdout(io.StringIO()):
+        # never the real adapter: on a version bump its health check would restart the live one
+        with patch.object(ccx.sys, 'argv', argv), patch.object(ccx, 'ensure_anthropic_proxy'), contextlib.redirect_stdout(io.StringIO()):
             ccx.main()
         assert expected in Path(ccx.APPLY_FILE).read_text()
     assert ccx.load_state()['autocompact'] == ''
@@ -705,3 +706,58 @@ with tempfile.TemporaryDirectory() as _d, patch.object(ccx, 'presets_path', retu
         with patch.object(ccx, 'preset_menu', side_effect=['manual', ccx.catalog.MenuBack]):
             ccx.main()
 print('preset launch menu ok')
+
+
+AGY_LISTING = """Fetching available models...
+gemini-4-neon-high\tGemini 4 Neon (High)
+gemini-4-neon-xhigh\tGemini 4 Neon (XHigh)
+gemini-4-neon-medium\tGemini 4 Neon (Medium)
+gemini-4-neon-low\tGemini 4 Neon (Low)
+gemini-pro-orchestrator-neon\tOrchestrator (Neon)
+gemini-3.8-flash-high\tGemini 3.8 Flash (High)
+gemini-3.8-flash-low\tGemini 3.8 Flash (Low)
+gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
+"""
+
+
+def test_agy_models_and_effort_mapping():
+    rows = ccx.agy_models(AGY_LISTING)
+    assert [r["id"] for r in rows] == ["gemini-4-neon", "gemini-pro-orchestrator-neon", "gemini-3.8-flash", "gpt-oss-120b"]
+    assert rows[0]["efforts"] == ["low", "medium", "high", "xhigh"] and rows[0]["name"] == "Gemini 4 Neon"
+    assert rows[1]["efforts"] is None and rows[1]["name"] == "Orchestrator (Neon)"
+    with patch.object(ccx, 'get_models', return_value=rows):
+        assert ccx.model_efforts('antigravity-cli', 'gemini-3.8-flash') == ["low", "high"]
+        assert ccx.agy_model_id('gemini-4-neon', 'xhigh') == 'gemini-4-neon-xhigh'
+        assert ccx.agy_model_id('gemini-4-neon', None) == 'gemini-4-neon-medium'
+        assert ccx.agy_model_id('gemini-4-neon', 'max') == 'gemini-4-neon-medium'
+        assert ccx.agy_model_id('gemini-3.8-flash', 'medium') == 'gemini-3.8-flash-low'  # no medium listed: the lowest
+        assert ccx.agy_model_id('gpt-oss-120b', 'high') == 'gpt-oss-120b-medium'
+        assert ccx.agy_model_id('gemini-pro-orchestrator-neon', 'high') == 'gemini-pro-orchestrator-neon'
+        assert ccx.agy_model_id('gemini-3.8-flash-low', 'high') == 'gemini-3.8-flash-low'  # a full agy id passes through
+
+
+def test_agy_provider_tables_and_fetch():
+    from types import SimpleNamespace
+    p = ccx.PROVIDERS['antigravity-cli']
+    assert p['format'] == 'openai' and p['key'] == 'cli' and 'antigravity-cli' not in ccx.FALLBACK_ROUTES
+    assert [i for i, _ in ccx.FALLBACK_MODELS['antigravity-cli']] == ['gemini-4-neon', 'gemini-4-argon', 'gemini-3.8-flash']
+    ran = SimpleNamespace(stdout=AGY_LISTING, stderr='', returncode=0)
+    with patch.object(ccx, 'agy_executable', return_value='agy.exe'), patch.object(ccx.subprocess, 'run', return_value=ran) as run:
+        models, live = ccx.fetch_models('antigravity-cli')
+    assert live and models[0]['id'] == 'gemini-4-neon' and run.call_args[0][0] == ['agy.exe', 'models']
+    assert 'creationflags' in run.call_args[1] or os.name != 'nt'
+    with patch.object(ccx, 'agy_executable', side_effect=RuntimeError('agy not found')), contextlib.redirect_stderr(io.StringIO()):
+        models, live = ccx.fetch_models('antigravity-cli')
+    assert not live and models[0] == {'id': 'gemini-4-neon', 'name': 'Gemini 4 Neon', 'context': None, 'output': None,
+                                      'efforts': ['low', 'medium', 'high', 'xhigh']}
+    with patch.object(ccx, 'agy_executable', return_value='agy.exe'), patch.object(ccx, 'ensure_anthropic_proxy'), \
+            patch.object(ccx, 'get_models', return_value=[{'id': 'gemini-3.8-flash', 'context': 1000000, 'efforts': ['low']}]):
+        env = ccx.route_env('antigravity-cli', 'gemini-3.8-flash')
+    assert env['ANTHROPIC_BASE_URL'].endswith('/antigravity-cli') and env['ANTHROPIC_AUTH_TOKEN'] == 'antigravity-cli'
+    assert env['CLAUDE_CODE_MAX_CONTEXT_TOKENS'] == 1000000
+    with patch.object(ccx, 'agy_executable', side_effect=RuntimeError('agy not found')), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            ccx.route_env('antigravity-cli', 'gemini-3.8-flash')
+            raise AssertionError('a missing agy must stop the launch')
+        except SystemExit:
+            pass

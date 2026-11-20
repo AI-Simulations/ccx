@@ -158,6 +158,7 @@ BRAND_COLORS = {
     'official': '#d97757',
     'commandcode': '#4f8cff',
     'commandcode-cli': '#4f8cff',
+    'antigravity-cli': '#3186ff',
     'opencode-go': '#14b8a6',
     'opencode-zen': '#14b8a6',
     'openai-oauth': '#10a37f',
@@ -183,7 +184,7 @@ GLYPHS = dict(zip('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789?', (
 
 
 # Providers whose names would collide as two letters (opencode, openai, openrouter).
-BADGE_TEXT = {'official': 'C', 'commandcode': 'CM', 'commandcode-cli': 'CM', 'opencode-go': 'OC',
+BADGE_TEXT = {'official': 'C', 'commandcode': 'CM', 'commandcode-cli': 'CM', 'antigravity-cli': 'AG', 'opencode-go': 'OC',
               'opencode-zen': 'OC', 'openai-oauth': 'AI', 'openrouter': 'OR', 'ollama-cloud': 'OL',
               'gemini': 'G', 'minimax': 'MM', 'nvidia': 'NV', 'lmstudio': 'LM',
               'MiMo': 'XI'}  # Xiaomi's MiMo would read MM, like MiniMax

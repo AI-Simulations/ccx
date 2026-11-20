@@ -44,7 +44,9 @@ DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h)")
 COOLDOWN = {}
 # Command Code's Go plan answers only its own CLI, so this route runs `cmdc -p` per request.
 CLI_ROUTE = "commandcode-cli"
-IDENTITY = {"service": "ccx-anthropic-proxy", "version": 36}
+# Google AI Pro answers through Google's Antigravity CLI: one `agy` run per request, text tool protocol.
+AGY_ROUTE = "antigravity-cli"
+IDENTITY = {"service": "ccx-anthropic-proxy", "version": 37}
 # `ccx official` (plain claude) comes in under this route: passed to Anthropic as sent, login and all,
 # until /model routes its launch to another provider.
 OFFICIAL_ROUTE = "official"
@@ -554,6 +556,97 @@ def cmdc_retrying(body, tries=3):
                 raise
 
 
+def agy_args(executable, model):
+    """agy's argv. Flags go before -p, which takes the next word as its prompt; the prompt itself goes on stdin."""
+    return [executable, "--output-format", "stream-json", "--input-format", "stream-json", "--print-timeout", f"{CLI_TIMEOUT}s",
+            "--disable-slash-commands", "--model", model, "--settings", json.dumps({"toolPermission": "strict"}), "-p", ""]
+
+
+def agy_stdin(prompt):
+    """The whole prompt as agy's one stream-json user event (Windows caps argv at 32k)."""
+    return json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+
+
+def agy_failure(error, stderr, code):
+    """A failed agy run as a public error: sign-in, quota (429) or agy's own reason."""
+    text = (error or "").strip() or stderr.strip()[-300:] or f"agy exited {code}"
+    low = f"{error or ''} {stderr}".lower()
+    if any(word in low for word in ("not authenticated", "unauthenticated", "not logged in", "not signed in", "please log in", "please sign in")):
+        failure = RuntimeError("Antigravity CLI is not signed in: run 'agy' once in a terminal and sign in with your Google account.")
+        failure.status_code = 401
+    else:
+        failure = RuntimeError(f"agy exited {code}: {text}"[:400])
+        quota = ("429", "quota", "resource_exhausted", "resource exhausted", "rate limit", "rate-limit", "usage limit")
+        failure.status_code = 429 if any(word in low for word in quota) else 502
+    failure.public = True
+    return failure
+
+
+def agy_events(body):
+    """One agy run as cmdc_events-style events: its reply's text deltas as they arrive, then one `result`
+    item (finalText, usage). agy's own tool steps are ignored; a failed run raises with agy's reason."""
+    ccx = _load_ccx_switch()
+    effort = (body.get("output_config") or {}).get("effort")
+    model = ccx.agy_model_id(body["model"], effort if isinstance(effort, str) else None)
+    try:
+        executable = ccx.agy_executable()
+    except RuntimeError as exc:
+        exc.public = True
+        raise
+    prompt = agy_stdin(to_prompt(body))
+    flags = background_process_options()
+    proc = subprocess.Popen(agy_args(executable, model), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", cwd=tempfile.gettempdir(), **flags)
+
+    def kill():
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, **flags)
+        proc.kill()
+
+    timer = threading.Timer(CLI_TIMEOUT + 60, kill)  # agy's own --print-timeout normally ends it first
+    timer.start()
+    errors = []
+    threading.Thread(target=lambda: errors.extend(proc.stderr), daemon=True).start()
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except OSError:
+        pass  # it died early; the exit code says why
+    result = {}
+    try:
+        for line in proc.stdout:
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            if item.get("event") == "result" and isinstance(item.get("result"), dict):
+                result = item["result"]
+            elif item.get("event") == "step_update" and isinstance(item.get("step_update"), dict):
+                step = item["step_update"]
+                delta = step.get("text_delta")
+                if step.get("step_type") == "agent_response" and isinstance(delta, str) and delta:
+                    yield {"type": "text_delta", "delta": delta}
+        proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:  # the client went away mid-reply
+            kill()
+    if proc.returncode or result.get("status") != "SUCCESS":
+        raise agy_failure(result.get("error"), "".join(errors), proc.returncode)
+    text = result.get("response") if isinstance(result.get("response"), str) else ""
+    if not text.strip():
+        failure = RuntimeError("agy answered no text: it tried its own tools instead of the client's tool protocol.")
+        failure.public = True
+        raise failure
+    tokens = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    yield {"type": "result", "finalText": text, "stopReason": None,
+           "usage": {"inputTokens": tokens.get("input_tokens") or 0,
+                     "outputTokens": (tokens.get("output_tokens") or 0) + (tokens.get("thinking_tokens") or 0),
+                     "cacheReadTokens": tokens.get("cache_read_tokens") or 0}}
+
+
 GENERATE_URL = "https://api.commandcode.ai/alpha/generate"
 
 
@@ -722,8 +815,9 @@ def collect(events, model):
     return {**message, "content": content}
 
 
-def commandcode_cli(body):
-    *_, result = cmdc_retrying(body)
+def commandcode_cli(body, source=None):
+    """One text-protocol CLI run (cmdc, or agy_events) as a non-streamed message."""
+    *_, result = (source or cmdc_retrying)(body)
     message = from_cli(result.get("finalText") or "", result.get("usage"), result.get("stopReason"), body["model"],
                        result.get("nativeCalls") or (), body.get("tools"))
     text = next((block["text"] for block in message["content"] if block["type"] == "text"), "")
@@ -732,14 +826,14 @@ def commandcode_cli(body):
     return message
 
 
-def cli_stream(body):
-    """cmdc's reply as Claude stream events, live: thinking and text as they arrive.
+def cli_stream(body, source=None):
+    """cmdc's (or agy_events') reply as Claude stream events, live: thinking and text as they arrive.
     Text from the first <tool_call> on is held back and becomes tool_use blocks, and a
     punctuation-only prefix is held until the reply says something."""
     yield message_start(body["model"])
     blocks, text, sent, held, spoken, result = Blocks(), "", 0, False, False, {}
     mark = "<tool_call>"
-    for event in cmdc_retrying(body):
+    for event in (source or cmdc_retrying)(body):
         kind, delta = event.get("type"), event.get("delta")
         if kind == "result":
             result = event
@@ -1333,7 +1427,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/health":
             self.send_json(200, IDENTITY)
-        elif len(path) == 3 and path[0] in (*UPSTREAMS, CLI_ROUTE) and path[1:] == ["v1", "models"]:
+        elif len(path) == 3 and path[0] in (*UPSTREAMS, CLI_ROUTE, AGY_ROUTE) and path[1:] == ["v1", "models"]:
             self.gateway_models(path[0])
         else:
             self.send_json(404, {"error": "Not found"})
@@ -1347,7 +1441,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"data": [{"id": override["model"], "display_name": override["model"]}],
                                  "has_more": False})
             return
-        if provider == CLI_ROUTE:
+        if provider in (CLI_ROUTE, AGY_ROUTE):
             # ccx-switch.py sits beside this file and owns the plan filter; without it,
             # listing the CLI's models could offer ones the subscription cannot use.
             self.send_json(200, {"data": [{"id": m["id"], "display_name": m["id"]} for m in ccx_models(provider)],
@@ -1383,7 +1477,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("Invalid request size (maximum 32 MiB)")
                 self.forward_official("POST", self.rfile.read(length) if length else b"")
                 return
-            if len(route) != 3 or route[0] not in (*UPSTREAMS, CLI_ROUTE, OFFICIAL_ROUTE) or route[1:] != ["v1", "messages"]:
+            if len(route) != 3 or route[0] not in (*UPSTREAMS, CLI_ROUTE, AGY_ROUTE, OFFICIAL_ROUTE) or route[1:] != ["v1", "messages"]:
                 self.send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": "Not found"}})
                 return
             if self.headers.get("Origin"):
@@ -1437,8 +1531,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             body = third_party_body(body)  # everything below leaves Anthropic
             active = override["provider"] if override else route[0]
-            if active == CLI_ROUTE:
-                self.answer_cli(body)
+            if active in (CLI_ROUTE, AGY_ROUTE):
+                self.answer_cli(body, agy=active == AGY_ROUTE)
                 return
             request = to_chat(body)
             if active == "openai-oauth" and cache_key(body):
@@ -1506,19 +1600,22 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_json(status, error, headers=response_headers)
 
-    def answer_cli(self, body):
+    def answer_cli(self, body, agy=False):
         """Streams Command Code's reply as it arrives, with pings while it is quiet: straight from
-        /alpha/generate on the CLI's login, or (CCX_CMDC_TEXT=1) one cmdc run with the text tool protocol."""
-        text_protocol = os.environ.get("CCX_CMDC_TEXT") == "1"
+        /alpha/generate on the CLI's login, or (CCX_CMDC_TEXT=1) one cmdc run with the text tool protocol.
+        agy: Google's Antigravity CLI, always one run with the text tool protocol."""
+        text_protocol = agy or os.environ.get("CCX_CMDC_TEXT") == "1"
+        source = agy_events if agy else None
         if text_protocol:
             to_prompt(body)  # reject bad input before any response is sent
         if not body.get("stream"):
-            self.send_json(200, commandcode_cli(body) if text_protocol else collect(generate_stream(body), body["model"]))
+            self.send_json(200, commandcode_cli(body, source) if text_protocol else collect(generate_stream(body), body["model"]))
             return
         events, gone = queue.Queue(), threading.Event()
+        label = "Antigravity CLI" if agy else "Command Code CLI"
 
         def run():
-            stream = cli_stream(body) if text_protocol else generate_stream(body)
+            stream = cli_stream(body, source) if text_protocol else generate_stream(body)
             try:
                 for event in stream:
                     if gone.is_set():
@@ -1526,7 +1623,7 @@ class Handler(BaseHTTPRequestHandler):
                     events.put(event)
             except Exception as exc:  # reported to the client as a stream error event
                 events.put({"type": "error", "error": {"type": "api_error",
-                            "message": f"Command Code CLI request failed: {type(exc).__name__}: {exc}"[:400]}})
+                            "message": f"{label} request failed: {type(exc).__name__}: {exc}"[:400]}})
             finally:
                 stream.close()  # a client that left kills the CLI run
                 events.put(None)

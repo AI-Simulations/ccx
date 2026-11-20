@@ -97,6 +97,7 @@ CONTEXT_PREFIX = "CCX_CONTEXT_V1 "
 PROVIDERS = {
     "commandcode": {"label": "Command Code API (needs Provider plan; Go plan is CLI-only)", "format": "anthropic", "base": "https://api.commandcode.ai/provider", "key": "commandcode"},
     "commandcode-cli": {"label": "Command Code subscription on the cmdc CLI login (Go plan; native tools, prompt cache)", "format": "openai", "key": "cli"},
+    "antigravity-cli": {"label": "Google AI Pro subscription on the Antigravity CLI login (agy; text tool protocol)", "format": "openai", "key": "cli"},
     "official":     {"label": "Claude official (claude.ai login)", "format": "anthropic", "base": ""},
     "minimax":      {"label": "MiniMax (Anthropic API)", "format": "anthropic", "base": "https://api.minimax.io/anthropic", "key": "minimax"},
     "opencode-go":  {"label": "OpenCode Go subscription (x-api-key, live key)", "format": "anthropic", "base": "https://opencode.ai/zen/go", "key": "opencode-go", "header": "x-api-key"},
@@ -228,10 +229,18 @@ FALLBACK_MODELS = {
     "openrouter":   [("anthropic/claude-opus-5.5", ""), ("anthropic/claude-fable-5.1", ""),
                      ("openai/gpt-6-sol", ""), ("deepseek/deepseek-v4.1-flash", "")],
     "commandcode-cli": [("deepseek/deepseek-v4.1-flash", ""), ("moonshotai/kimi-k3", ""), ("zai-org/glm-5.3", "")],
+    "antigravity-cli": [("gemini-4-neon", "Gemini 4 Neon"), ("gemini-4-argon", "Gemini 4 Argon"), ("gemini-3.8-flash", "Gemini 3.8 Flash")],
     "nvidia":       [("deepseek-ai/deepseek-v4.1-flash", ""), ("z-ai/glm-5.3", ""), ("moonshotai/kimi-k2.6", "")],
     "openai-oauth": [("gpt-6.1-sol", ""), ("gpt-6.1-terra", ""), ("gpt-6-sol", ""), ("gpt-6-luna", "")],
     "minimax":      [("MiniMax-M3", ""), ("MiniMax-M2.7", "")],
 }
+# agy (Antigravity CLI) lists one id per model and effort (gemini-4-neon-high): ccx offers the base id with
+# those suffixes as its efforts, and the adapter joins them again per request (agy_model_id).
+AGY_EFFORTS = ("low", "medium", "high", "xhigh")
+AGY_EFFORT_RE = re.compile(r"(.+)-(low|medium|high|xhigh)")
+# offline: the efforts `agy models` listed for the fallback models (agy 1.5.13, 2026-11-20)
+AGY_FALLBACK_EFFORTS = {"gemini-4-neon": ["low", "medium", "high", "xhigh"], "gemini-4-argon": ["low", "medium", "high"],
+                        "gemini-3.8-flash": ["low", "medium", "high"]}
 
 
 def die(msg):
@@ -1096,7 +1105,56 @@ def model_efforts(name, model_id):
         return commandcode_efforts(model_id)
     if name == "openai-oauth":
         return codex_efforts(model_id)
+    if name == "antigravity-cli":
+        return agy_efforts(model_id)
     return None
+
+
+def agy_executable():
+    """Google's Antigravity CLI (agy): PATH first, then its per-user install; RuntimeError when missing."""
+    import shutil
+    local = (os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local"), "agy", "bin", "agy.exe")
+             if os.name == "nt" else os.path.expanduser("~/.local/bin/agy"))
+    for path in (shutil.which("agy"), local):
+        if path and os.path.isfile(path):
+            return path
+    raise RuntimeError(f"Antigravity CLI (agy) not found on PATH or at {local}; install it, then run 'agy' once and sign in.")
+
+
+def agy_models(listing):
+    """`agy models` output as ccx model rows: one per base id, with its effort suffixes (low..xhigh) as its efforts."""
+    rows = {}
+    for line in listing.splitlines():
+        mid, tab, label = line.strip().partition("\t")
+        if not tab or not mid:
+            continue  # the "Fetching available models..." line
+        match = AGY_EFFORT_RE.fullmatch(mid)
+        base = match[1] if match else mid
+        row = rows.setdefault(base, {"id": base, "name": re.sub(r"\s*\([^()]*\)$", "", label.strip()) if match else label.strip(),
+                                     "context": None, "output": None, "efforts": []})
+        if match:
+            row["efforts"].append(match[2])
+    for row in rows.values():
+        row["efforts"] = [e for e in AGY_EFFORTS if e in row["efforts"]] or None
+    return list(rows.values())
+
+
+def agy_efforts(model_id):
+    """The efforts agy lists for a base model id (the cached listing, else a fetch); None for an id listed without."""
+    entry = _models_cache().get("antigravity-cli") if MODELS_TTL > 0 else None
+    models = entry["models"] if entry else get_models("antigravity-cli")
+    key = str(model_id or "").casefold()
+    return next((m.get("efforts") for m in models if isinstance(m, dict) and str(m.get("id", "")).casefold() == key), None)
+
+
+def agy_model_id(model_id, effort=None):
+    """The id agy runs: <base>-<effort> with the request's effort when the model lists it, else medium, else the
+    lowest it lists; an id listed without efforts (an orchestrator, or a full agy id) passes through unchanged."""
+    levels = agy_efforts(model_id)
+    if not levels:
+        return model_id
+    pick = effort if effort in levels else "medium" if "medium" in levels else levels[0]
+    return f"{model_id}-{pick}"
 
 
 def commandcode_plan_models():
@@ -1216,6 +1274,14 @@ def fetch_models(name):
                        if isinstance(m, dict) and isinstance(m.get("id"), str)}
             models = [{"id": mid, "name": "", "context": None, "output": None,
                        "efforts": efforts.get(mid.casefold())} for mid in ids]
+        elif name == "antigravity-cli":
+            # One id per model and effort; ccx lists the base ids with their efforts (agy_model_id joins them).
+            import tempfile
+            out = subprocess.run([agy_executable(), "models"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                 timeout=60, cwd=tempfile.gettempdir(), **background_process_options())
+            models = agy_models(out.stdout or "")
+            if out.returncode or not models:
+                raise RuntimeError((out.stderr or out.stdout or "").strip()[-200:] or f"agy models exited {out.returncode}")
         elif name == "opencode-go":
             live = fetch("https://opencode.ai/zen/go/v1/models", {"x-api-key": auth_key("opencode-go")})
             limits = go_limits()
@@ -1276,6 +1342,8 @@ def fetch_models(name):
     live = not failed and bool(models or filtered)
     if not models and not filtered:  # offline fallback must not re-offer plan-locked models
         models = [{"id": i, "name": n, "context": None, "output": None} for i, n in FALLBACK_MODELS.get(name, [])]
+        if name == "antigravity-cli":
+            models = [{**m, "efforts": AGY_FALLBACK_EFFORTS.get(m["id"])} for m in models]
     return models, live
 
 
@@ -1372,7 +1440,7 @@ def ensure_anthropic_proxy():
 
 def _ensure_anthropic_proxy():
     url = f"http://127.0.0.1:{ADAPTER_PORT}/health"
-    expected = {"service": "ccx-anthropic-proxy", "version": 36}  # unchanged: a bump restarts every session's adapter
+    expected = {"service": "ccx-anthropic-proxy", "version": 37}  # the adapter's IDENTITY: a bump restarts every session's adapter
     try:
         running = fetch(url, timeout=1)
     except (OSError, ValueError):
@@ -1500,7 +1568,7 @@ def model_menu(name, default=None, role=""):
         if type(m.get("context")) is int and m["context"] > 0:  # the provider's own figure wins
             info = {**info, "limit": {**(info.get("limit") or {}), "context": m["context"]}}
         rows.append((m["id"], info))
-    paid_by = "; your subscription pays" if name in ("official", "opencode-go", "openai-oauth", "commandcode-cli") else ""
+    paid_by = "; your subscription pays" if name in ("official", "opencode-go", "openai-oauth", "commandcode-cli", "antigravity-cli") else ""
     return catalog._pick_model(PROVIDERS[name]["label"], rows, default, role, paid_by, back=True)
 
 
@@ -1945,6 +2013,11 @@ def route_env(name, model_id, passthrough=False):
             ensure_oauth_proxy()
         elif name == "commandcode-cli":
             pass  # the adapter posts to /alpha/generate on the CLI's login (CCX_CMDC_TEXT=1: one cmdc run per request)
+        elif name == "antigravity-cli":
+            try:
+                agy_executable()  # the adapter runs one agy per request on its Google login
+            except RuntimeError as exc:
+                die(str(exc))
         elif not key and p["key"] and name != "lmstudio":  # LM Studio runs keyless unless auth is on
             die(f"No API key configured for {name}.")
         ensure_anthropic_proxy()
@@ -1953,7 +2026,7 @@ def route_env(name, model_id, passthrough=False):
         env["ENABLE_TOOL_SEARCH"] = "false"
 
     models = get_models(name) if name != "official" else []
-    if name in ("opencode-go", "opencode-zen", "commandcode", "commandcode-cli"):
+    if name in ("opencode-go", "opencode-zen", "commandcode", "commandcode-cli", "antigravity-cli"):
         # After the credentials: a missing key must fail without fetching the catalog.
         # Only typed ids can miss: the menu lists usable models only.
         known = {m["id"].casefold() for m in models}

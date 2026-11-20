@@ -174,6 +174,9 @@ def default_effort(provider, model_id):
     if provider in ("commandcode", "commandcode-cli"):
         cfg = read_json(os.path.expanduser("~/.commandcode/config.json"))
         return (cfg.get("reasoningEffort") or {}).get(model_id) or cfg.get("effort")
+    if provider == "antigravity-cli":  # agy has no default of its own: the adapter runs medium when listed
+        levels = effort_levels(provider, model_id) or ()
+        return "medium" if "medium" in levels else next(iter(levels), None)
     if provider == "openai-oauth":
         rows = read_json(os.path.join(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"),
                                       "models_cache.json")).get("models") or ()
@@ -203,6 +206,12 @@ def effort_levels(provider, model_id):
                 if not isinstance(levels, list):
                     return None
                 return [e["effort"] for e in levels if isinstance(e, dict) and isinstance(e.get("effort"), str)]
+        return None
+    if provider == "antigravity-cli":  # ccx-switch.py's cached `agy models` listing
+        rows = (read_json(os.path.expanduser("~/.config/ccx/models-cache.json")).get("antigravity-cli") or {}).get("models") or ()
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("id", "")).casefold() == key:
+                return row.get("efforts") if isinstance(row.get("efforts"), list) else None
         return None
     if provider in ("commandcode", "commandcode-cli"):
         models = read_json(os.path.expanduser("~/.config/ccx/efforts.json")).get("models") or {}
@@ -502,7 +511,7 @@ def ccx_main_provider(source):
     if os.environ.get("CCX_MAIN_PROVIDER"):
         return os.environ["CCX_MAIN_PROVIDER"]
     url = os.environ.get("ANTHROPIC_BASE_URL", "").lower().rstrip("/")
-    for provider in ("commandcode-cli", "commandcode", "nvidia", "minimax", "openrouter", "opencode-zen", "gemini", "ollama-cloud", "lmstudio"):
+    for provider in ("antigravity-cli", "commandcode-cli", "commandcode", "nvidia", "minimax", "openrouter", "opencode-zen", "gemini", "ollama-cloud", "lmstudio"):
         if provider in url:
             return provider
     return {"anthropic": "official", "openai": "openai-oauth", "opencode-go": "opencode-go", "hyper": "hyper"}.get(
@@ -1144,7 +1153,7 @@ def render(d):
             target = re.sub(r'^(?:gpt|claude)-', '', mid.rsplit('/', 1)[-1], flags=re.I)
             target = re.sub(r'^(opus|sonnet|haiku)-(\d+)-(\d+)', r'\1 \2.\3', target).replace('-', ' ')
             labels = {'openai-oauth': 'OAuth', 'official': 'Claude', 'nvidia': 'NIM',
-                      'commandcode': 'CmdC', 'commandcode-cli': 'CmdC CLI', 'minimax': 'MiniMax',
+                      'commandcode': 'CmdC', 'commandcode-cli': 'CmdC CLI', 'antigravity-cli': 'Agy', 'minimax': 'MiniMax',
                       'opencode-go': 'Go', 'opencode-zen': 'Zen', 'openrouter': 'OpenRouter',
                       'gemini': 'Gemini', 'ollama-cloud': 'Ollama', 'lmstudio': 'LM Studio'}
             route = '' if provider == main_provider else ' · ' + labels.get(provider, provider)  # same provider: no label

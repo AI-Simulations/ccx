@@ -794,3 +794,110 @@ finally:
     proxy.OFFICIAL_UPSTREAM = saved_upstream
     echo.shutdown(); adapter.shutdown()
 print("PASS: proxied official URL, plain-http relay, CONNECT tunnel")
+
+
+# Antigravity CLI route: argv, stdin shape and agy's stream-json, with a fake process (no agy run).
+class _AgyPipe:
+    def __init__(self):
+        self.text, self.closed = "", False
+    def write(self, text):
+        self.text += text
+    def close(self):
+        self.closed = True
+
+
+class _AgyProc:
+    def __init__(self, lines, code=0, err=""):
+        self.stdin, self.stdout, self.stderr = _AgyPipe(), iter(lines), iter([err] if err else [])
+        self.code, self.returncode, self.pid = code, None, 1
+    def wait(self):
+        self.returncode = self.code
+        return self.code
+    def poll(self):
+        return self.returncode
+    def kill(self):
+        pass
+
+
+def _agy_run(lines, code=0, err="", body=None, stream=False):
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    seen = {}
+    def popen(args, **kw):
+        seen["args"], seen["kw"] = args, kw
+        seen["proc"] = _AgyProc([json.dumps(x) + "\n" for x in lines], code, err)
+        return seen["proc"]
+    fake = SimpleNamespace(agy_model_id=lambda m, e: f"{m}-{e or 'medium'}", agy_executable=lambda: "agy.exe")
+    body = body or {"model": "gemini-3.8-flash", "max_tokens": 64, "output_config": {"effort": "low"},
+                    "messages": [{"role": "user", "content": "hi"}]}
+    with patch.object(proxy, "_load_ccx_switch", return_value=fake), patch.object(proxy.subprocess, "Popen", side_effect=popen):
+        out = list(proxy.cli_stream(body, proxy.agy_events)) if stream else proxy.commandcode_cli(body, proxy.agy_events)
+    return out, seen
+
+
+def _agy_delta(text, state="ACTIVE", kind="agent_response"):
+    return {"event": "step_update", "step_update": {"step_type": kind, "state": state, "text_delta": text}}
+
+
+def _agy_result(response, status="SUCCESS", error=""):
+    return {"event": "result", "result": {"status": status, "response": response, "error": error,
+            "usage": {"input_tokens": 9956, "output_tokens": 80, "thinking_tokens": 5, "cache_read_tokens": 7, "total_tokens": 10048}}}
+
+
+def test_agy_args_and_stdin():
+    args = proxy.agy_args("agy.exe", "gemini-3.8-flash-low")
+    assert args[-2:] == ["-p", ""] and args[args.index("--model") + 1] == "gemini-3.8-flash-low"
+    assert args[args.index("--output-format") + 1] == "stream-json" and args[args.index("--input-format") + 1] == "stream-json"
+    assert json.loads(args[args.index("--settings") + 1]) == {"toolPermission": "strict"} and "--disable-slash-commands" in args
+    assert args[args.index("--print-timeout") + 1].endswith("s")
+    line = proxy.agy_stdin('say "hi"\nnow')
+    assert line.endswith("\n") and line.count("\n") == 1
+    assert json.loads(line) == {"event": "user", "message": {"content": 'say "hi"\nnow'}}
+
+
+def test_agy_success_text_and_tool_call():
+    tools = [{"name": "Read", "description": "read", "input_schema": {"type": "object"}}]
+    body = {"model": "gemini-3.8-flash", "max_tokens": 64, "output_config": {"effort": "low"}, "tools": tools,
+            "messages": [{"role": "user", "content": "read a.txt"}]}
+    reply = 'Reading.<tool_call>{"name": "Read", "input": {"file_path": "a.txt"}}</tool_call>'
+    lines = [{"event": "init"}, _agy_delta("", kind="user_input"), _agy_delta("Reading.<tool_"),
+             _agy_delta('call>{"name": "Read", "input": {"file_path": "a.txt"}}</tool_call>', "DONE"), _agy_result(reply)]
+    message, seen = _agy_run(lines, body=body)
+    assert seen["args"][seen["args"].index("--model") + 1] == "gemini-3.8-flash-low" and seen["args"][0] == "agy.exe"
+    assert seen["kw"]["cwd"] == tempfile.gettempdir() and seen["proc"].stdin.closed
+    sent = json.loads(seen["proc"].stdin.text)
+    assert sent["event"] == "user" and "<tool_call>" in sent["message"]["content"] and "read a.txt" in sent["message"]["content"]
+    assert message["stop_reason"] == "tool_use"
+    assert [b["type"] for b in message["content"]] == ["text", "tool_use"] and message["content"][1]["input"] == {"file_path": "a.txt"}
+    assert message["usage"]["input_tokens"] == 9956 and message["usage"]["output_tokens"] == 85
+    assert message["usage"]["cache_read_input_tokens"] == 7
+    # Streamed: the text before the tag goes out, never half a <tool_call>.
+    events, _ = _agy_run(lines, body=body, stream=True)
+    texts = "".join(e["delta"].get("text", "") for e in events if e["type"] == "content_block_delta")
+    assert texts == "Reading." and "<tool" not in texts
+    assert any(e["type"] == "content_block_start" and e["content_block"]["type"] == "tool_use" for e in events)
+    assert events[-2]["delta"]["stop_reason"] == "tool_use" and events[-1]["type"] == "message_stop"
+    # Plain text streams as it arrives; agy's own tool steps are ignored.
+    plain = [_agy_delta("Hel"), _agy_delta("ignored", kind="tool_call"), _agy_delta("lo", "DONE"), _agy_result("Hello")]
+    events, _ = _agy_run(plain, stream=True)
+    assert "".join(e["delta"].get("text", "") for e in events if e["type"] == "content_block_delta") == "Hello"
+    assert _agy_run(plain)[0]["content"] == [{"type": "text", "text": "Hello"}]
+
+
+def test_agy_failures():
+    import pytest
+    with pytest.raises(RuntimeError) as err:
+        _agy_run([_agy_result("", "ERROR", "model overloaded")], code=1)
+    assert "model overloaded" in str(err.value) and err.value.status_code == 502 and err.value.public
+    with pytest.raises(RuntimeError) as err:
+        _agy_run([_agy_result("", "ERROR", "")], code=1, err="Error: not authenticated\n")
+    assert "sign in" in str(err.value) and err.value.status_code == 401
+    with pytest.raises(RuntimeError) as err:
+        _agy_run([_agy_result("", "ERROR", "429 RESOURCE_EXHAUSTED: quota")], code=1)
+    assert err.value.status_code == 429
+    # Only agy's own tool steps and no answer text: a clear error, not an empty reply.
+    with pytest.raises(RuntimeError) as err:
+        _agy_run([_agy_delta("x", kind="run_command"), _agy_result("")])
+    assert "own tools" in str(err.value)
+    with pytest.raises(RuntimeError):
+        _agy_run([_agy_delta("partial")], code=0)  # no result line at all
