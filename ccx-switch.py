@@ -371,7 +371,13 @@ def write_json(path, data, **dump):
     # Replace, not rewrite: a Ctrl+C quit mid-save must not leave a truncated file.
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(data, f, **dump)
-    os.replace(path + ".tmp", path)
+    for attempt in range(40):  # Windows refuses while another process (a status line) has the file open
+        try:
+            return os.replace(path + ".tmp", path)
+        except PermissionError:
+            if attempt == 39:
+                raise
+            time.sleep(0.05)
 
 
 def save_state(data):
