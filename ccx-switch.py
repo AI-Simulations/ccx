@@ -1585,7 +1585,7 @@ def ensure_anthropic_proxy():
 
 def _ensure_anthropic_proxy():
     url = f"http://127.0.0.1:{ADAPTER_PORT}/health"
-    expected = {"service": "ccx-anthropic-proxy", "version": 38}  # the adapter's IDENTITY: a bump restarts every session's adapter
+    expected = {"service": "ccx-anthropic-proxy", "version": 39}  # the adapter's IDENTITY: a bump restarts every session's adapter
     try:
         running = fetch(url, timeout=1)
     except (OSError, ValueError):
@@ -1887,7 +1887,7 @@ def helper_command(words):
 
 def on_adapter():
     """This session reaches the adapter: an adapter route, or `ccx official` passed through it."""
-    return (os.environ.get("CCX_MAIN_PROVIDER") in FALLBACK_ROUTES
+    return (os.environ.get("CCX_MAIN_PROVIDER") in FALLBACK_ROUTES or bool(os.environ.get("CCX_HARNESS"))
             or os.environ.get("ANTHROPIC_BASE_URL", "") in OFFICIAL_BASES)
 
 
@@ -2408,7 +2408,7 @@ def apply(name, model_id=None, no_run=False, claude_args=(), effort=None, autoco
 # adapter's /ccx/<launch> route. The harness asks for placeholder models (ccx-main, ccx-live-<profile>,
 # ccx-auto, ccx-tools); the adapter maps them to this launch's picks and does the fallback itself.
 
-HARNESSES = ("claude", "pi", "hermes", "opencode", "commandcode")
+HARNESSES = ("claude", "pi", "hermes", "opencode", "commandcode", "codex", "agy")
 HARNESS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harness")
 HARNESS_KEY = "ccx-local"  # the harness's API key: the adapter holds the real ones
 # Hermes side calls that follow the Tools model (auxiliary.<task>); vision and approval stay apart.
@@ -2477,6 +2477,36 @@ def hermes_create_profile(name):
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def hermes_reload_plugins(name):
+    """Has the running Hermes gateway rediscover profile `name`'s plugins: it began serving the new profile
+    before ccx wrote its config, and loads newly enabled plugins only when `hermes plugins` asks it to."""
+    for verb in ("disable", "enable"):
+        subprocess.run(["hermes", "-p", name, "plugins", verb, "ccx-cmd"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def hermes_user_settings():
+    """From the user's own Hermes config: its version (a profile config without one is taken for an
+    ancient one) and the shared-metrics answer, so a ccx profile never asks again."""
+    try:
+        text = (hermes_root() / "config.yaml").read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    settings = {}
+    version = re.search(r"^_config_version:\s*(\d+)", text, re.M)
+    if version:
+        settings["_config_version"] = int(version.group(1))
+    block = re.search(r"^telemetry:\s*\n((?:[ \t]+.*\n?|\s*\n)*)", text, re.M)
+    metrics = {"enabled": False, "send": False}
+    for key in ("enabled", "send", "offer_version"):
+        found = re.search(rf"^[ \t]+{key}:\s*(\S+)", block.group(1) if block else "", re.M)
+        if found:
+            value = found.group(1).lower()
+            metrics[key] = int(value) if value.isdigit() else value == "true"
+    settings["telemetry"] = {"shared_metrics": metrics}
+    return settings
+
+
 def hermes_launch(launch, parts, effort, args):
     """Hermes on a ccx profile named after the launch's picks: Hermes reads subagent, approval and
     side-task models only from config, and one gateway serves every profile (a separate HERMES_HOME
@@ -2488,18 +2518,24 @@ def hermes_launch(launch, parts, effort, args):
     if not home.is_dir():
         die(f"Could not create the Hermes profile {launch}; check `hermes profile create {launch}`.")
     route = {"base_url": f"{ADAPTER_URL}/ccx/{launch}", "api_key": HARNESS_KEY, "api_mode": "anthropic_messages"}
-    config = {"model": {"default": "ccx-main", "provider": "ccx"},
+    config = {**hermes_user_settings(), "model": {"default": "ccx-main", "provider": "ccx"},
               "providers": {"ccx": {"name": "ccx", **route}},
               "agent": {**({"reasoning_effort": effort} if effort else {})},
               "skills": {"external_dirs": [str(hermes_root() / "skills")]}}
     subagents = parts["subagents"]
+    plugins = ["ccx-cmd", *(["ccx-router"] if parts["router"] else [])]
+    unseen = [name for name in plugins if not (home / "plugins" / name).is_dir()]  # new to the gateway
+    config["plugins"] = {"enabled": plugins}
+    for name in plugins:
+        plugin = home / "plugins" / name
+        shutil.rmtree(plugin, ignore_errors=True)
+        shutil.copytree(os.path.join(HARNESS_DIR, "hermes", name), plugin, ignore=shutil.ignore_patterns("__pycache__"))
+    # /ccx runs in the Hermes gateway, which lacks this launch's environment: the plugin reads it here
+    write_json(str(home / "plugins" / "ccx-cmd" / "ccx.json"), {
+        "launch": launch, "provider": os.environ.get("CCX_MAIN_PROVIDER", ""), "python": sys.executable,
+        "switch": os.path.abspath(__file__)}, indent=1)
     if parts["router"]:
         config["delegation"] = {"backend": "ccx-router", "backends": {"ccx-router": {**route, "levels": subagents}}}
-        config["plugins"] = {"enabled": ["ccx-router"]}
-        plugin = home / "plugins" / "ccx-router"
-        shutil.rmtree(plugin, ignore_errors=True)
-        shutil.copytree(os.path.join(HARNESS_DIR, "hermes", "ccx-router"), plugin,
-                        ignore=shutil.ignore_patterns("__pycache__"))
     elif subagents:
         one = next((a for a in subagents if a["name"] == "sub"), subagents[0])
         config["delegation"] = {"provider": "custom", "model": one["model"], **route}
@@ -2513,6 +2549,8 @@ def hermes_launch(launch, parts, effort, args):
     if aux:
         config["auxiliary"] = aux
     write_json(str(home / "config.yaml"), config, indent=2)  # JSON is YAML
+    if unseen:
+        hermes_reload_plugins(launch)
     program = ["hermes", "-p", launch, "chat", "--cli", "--provider", "ccx", "-m", "ccx-main",
                *(["--reasoning", effort] if effort else []), *args]
     return program, {"CCX_LAUNCH_ID": launch}
@@ -2580,9 +2618,10 @@ def opencode_launch(launch, parts, effort, args):
                                     "settings": {"baseURL": f"{ADAPTER_URL}/ccx/{launch}/v1", "apiKey": HARNESS_KEY},
                                     "models": models}},
               "agents": agents}
-    if parts["auto"]:
-        # the plugin judges every action the user's rules allow or ask about; their denies stay final
-        config["plugins"] = [{"package": os.path.join(HARNESS_DIR, "opencode", "ccx-auto")}]
+    # /ccx in the TUI runs ccx on this launch; with Auto, the plugin judges every action the user's rules
+    # allow or ask about (their denies stay final)
+    config["plugins"] = [{"package": os.path.join(HARNESS_DIR, "opencode", "ccx-cmd")},
+                         *([{"package": os.path.join(HARNESS_DIR, "opencode", "ccx-auto")}] if parts["auto"] else [])]
     return ["opencode", "--standalone", *args], {"OPENCODE_CONFIG_CONTENT": json.dumps(config, separators=(",", ":")),
                                                  "CCX_LAUNCH_ID": launch}
 
@@ -2676,6 +2715,7 @@ def commandcode_launch(launch, parts, effort, args):
     if real_agents.is_dir():  # the user's own agents beside ccx's
         mirror_home(real_agents, cc / "agents")
     program = ["cmdc", "--model", "ccx/ccx-main", *(["--effort", effort] if effort else []), "--local-only",
+               "--mod", os.path.join(HARNESS_DIR, "commandcode", "ccx.ts"),
                *(["--yolo"] if parts["auto"] else []), *args]  # Auto: the classifier hook answers instead of you
     return program, {"HOME": str(home), "USERPROFILE": str(home), "CCX_LAUNCH_ID": launch}
 
@@ -2732,8 +2772,84 @@ def harness_auto(launch, payload, post=harness_post):
                                    "permissionDecisionReason": reason}}
 
 
+def toml_value(value):
+    """A `codex -c key=value` value: TOML, whose strings, numbers and booleans JSON spells alike
+    (unescaped: TOML has no surrogate-pair escapes)."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def codex_launch(launch, parts, effort, args):
+    """Codex on the ccx provider (the adapter's Responses API route), set with -c for this launch only:
+    router levels and profiles as agent roles, Auto as Codex's own reviewer (its model, codex-auto-review,
+    is the Auto pick on the adapter), Tools on /review and memories. The adapter applies the effort."""
+    folder = Path(CFG_DIR) / "codex"  # role files name a placeholder model only: every launch shares them
+    folder.mkdir(parents=True, exist_ok=True)
+    config = {"model_provider": "ccx", "model_providers.ccx.name": "ccx",
+              "model_providers.ccx.base_url": f"{ADAPTER_URL}/ccx/{launch}/v1",
+              "model_providers.ccx.wire_api": "responses", "model_providers.ccx.env_key": "CCX_HARNESS_KEY"}
+    if parts.get("context"):
+        config["model_context_window"] = parts["context"]
+    subagents = parts["subagents"]
+    if not subagents:
+        config["agents.enabled"] = False
+    for sub in subagents:
+        role = folder / f"ccx-{sub['name']}.toml"
+        role.write_text(f"model = {toml_value(sub['model'])}\nmodel_provider = \"ccx\"\n", encoding="utf-8")
+        config[f"agents.ccx-{sub['name']}.description"] = (
+            sub["description"] + (f" (difficulty {sub['range'][0]}-{sub['range'][1]})" if sub.get("range") else ""))
+        config[f"agents.ccx-{sub['name']}.config_file"] = str(role)
+    if subagents:  # Codex's `default` role (a spawn without a role): the one profile, or the router's middle level
+        default = (next((a for a in subagents if a["name"] == "sub"), subagents[0]) if not parts["router"]
+                   else subagents[(len(subagents) - 1) // 2])
+        config["agents.default.description"] = "Default agent: " + default["description"]
+        config["agents.default.config_file"] = str(folder / f"ccx-{default['name']}.toml")
+    if parts["auto"]:
+        config.update({"approval_policy": "on-request", "approvals_reviewer": "auto_review"})
+    if parts["tools"]:
+        config.update({"review_model": "ccx-tools", "memories.extract_model": "ccx-tools",
+                       "memories.consolidation_model": "ccx-tools"})
+    program = ["codex"]
+    for key, value in config.items():
+        program += ["-c", f"{key}={toml_value(value)}"]
+    return [*program, "-m", "ccx-main", *args], {"CCX_HARNESS_KEY": HARNESS_KEY}
+
+
+def agy_launch(launch, parts, effort, args):
+    """The Antigravity CLI in its gateway mode on the adapter's chat completions route: the main model
+    and every subagent profile as a gateway model. agy has no per-launch Auto or Tools model."""
+    models = ["ccx-main", *(s["model"] for s in parts["subagents"])]
+    return ["agy", "--model", "ccx-main", *args], {
+        "AGY_LLM_GATEWAY_URL": f"{ADAPTER_URL}/ccx/{launch}", "AGY_LLM_GATEWAY_API_KEY": HARNESS_KEY,
+        "AGY_LLM_GATEWAY_WIRE_PROTOCOL": "openai", "AGY_LLM_GATEWAY_MODELS": ",".join(models)}
+
+
+def ccx_shims():
+    """A folder with a `ccx` command for harness shells (`!ccx ...` in Codex and agy, a model's shell tool):
+    this ccx, on the launch's environment."""
+    folder = Path(CFG_DIR) / "bin"
+    folder.mkdir(parents=True, exist_ok=True)
+    switch = os.path.abspath(__file__)
+    shims = {"ccx.cmd": f'@"{sys.executable}" -B "{switch}" %*\r\n',
+             "ccx": f'#!/bin/sh\nexec {sh_quote(sys.executable)} -B {sh_quote(switch)} "$@"\n'}
+    for name, text in shims.items():
+        path = folder / name
+        # cmd.exe reads a batch file in the console's code page, not UTF-8
+        encoding = "oem" if name.endswith(".cmd") and os.name == "nt" else "utf-8"
+        try:
+            same = path.read_text(encoding=encoding, newline="") == text
+        except (OSError, ValueError):
+            same = False
+        if not same:
+            path.write_text(text, encoding=encoding, errors="replace", newline="")
+            if name == "ccx":
+                path.chmod(0o755)
+    return folder
+
+
+# What `ccx <word> ...` may be inside a harness session (main)
+HARNESS_SESSION_COMMANDS = ("route", "fallback", "helper", "agents", "gui", "presets", "providers", "models", "facts")
 HARNESS_LAUNCHERS = {"pi": pi_launch, "hermes": hermes_launch, "opencode": opencode_launch,
-                     "commandcode": commandcode_launch}
+                     "commandcode": commandcode_launch, "codex": codex_launch, "agy": agy_launch}
 
 
 def launch_harness(harness, name, model_id, effort, overrides, fallback_flag, args):
@@ -2770,8 +2886,13 @@ def launch_harness(harness, name, model_id, effort, overrides, fallback_flag, ar
     if harness in FILE_HARNESSES:
         launch = settle_launch(launch, harness, parts, effort)
         os.environ["CCX_LAUNCH_ID"] = _STARTUP_LAUNCH = launch
+    os.environ["CCX_MAIN_PROVIDER"] = name
     program, env = HARNESS_LAUNCHERS[harness](launch, parts, effort, args)
-    write_apply(env, [], True, program=program)
+    # every harness session: its launch, so ccx (/ccx, `!ccx`, the model picker) edits that session only
+    env = {**env, "CCX_LAUNCH_ID": launch, "CCX_HARNESS": harness, "CCX_MAIN_PROVIDER": name,
+           "CCX_PYTHON": sys.executable, "CCX_SWITCH": os.path.abspath(__file__),
+           "PATH": str(ccx_shims()) + os.pathsep + os.environ.get("PATH", "")}
+    write_apply(env, [v for v in CCX_VARS + OAI_VARS if v not in env], True, program=program)
     print(f"\n{harness}: main {name}/{model_id}" + (f" · {effort}" if effort else "")
           + (f"; fallback {fallback['provider']}/{fallback['model']}" if fallback else "")
           + f"; subagents {', '.join(s['name'] for s in parts['subagents']) or 'off'}"
@@ -2791,7 +2912,7 @@ def session_launch():
     """The launch a subagent edit belongs to: inside its Claude session or its startup prompt only.
     apply.ps1 leaves CCX_LAUNCH_ID in the terminal, and a later plain `ccx agents` edits agents.json."""
     launch = os.environ.get("CCX_LAUNCH_ID", "")
-    if launch and (os.environ.get("CLAUDECODE") == "1" or launch == _STARTUP_LAUNCH):
+    if launch and (os.environ.get("CLAUDECODE") == "1" or os.environ.get("CCX_HARNESS") or launch == _STARTUP_LAUNCH):
         return launch
     # A Claude session not started by ccx still gets its own subagent setup, keyed by its session id.
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "") if os.environ.get("CLAUDECODE") == "1" else ""
@@ -4419,6 +4540,16 @@ def main():
         if live:
             _save_models(args[1], models)
         return
+    if os.environ.get("CCX_HARNESS") and os.environ.get("CCX_LAUNCH_ID"):
+        # `ccx` (/ccx, !ccx) inside a harness session edits that session: no launch (it would save a new
+        # default route and leave an apply file behind) and no terminal menu (nothing can answer it there)
+        if not args:
+            return gui_command(["model"])
+        if args == ["agents"]:
+            return gui_command(["subagent"])
+        if args[0] not in HARNESS_SESSION_COMMANDS:
+            die(f"Inside a {os.environ['CCX_HARNESS']} session ccx changes this session only: "
+                + ", ".join(HARNESS_SESSION_COMMANDS) + ". Start another launch from a terminal.")
     if args[:1] == ["fallback"]:
         return fallback_command(args[1:])
     if args[:1] == ["route"]:

@@ -16,7 +16,7 @@ FILES = ('ccx-switch.py', 'ccx-switch.ps1', 'ccx-anthropic-proxy.py', 'opencode_
          'oauth-errors.mjs', 'test_ccx_switch.py', 'test_ccx_resume.py', 'test_ccx_proxy.py',
          'statusline.py', 'test_statusline.py', 'critic_mock_check.py', 'install-resume.py', 'README.md',
          'ccx-gui.py', 'test_ccx_gui.py', 'ccx.ico', 'test_ccx_harness.py')
-# What ccx ships for other harnesses (`ccx --harness ...`): the pi extension, the Hermes router plugin.
+# What ccx ships for other harnesses (`ccx --harness ...`): their extensions, plugins and mods.
 HARNESS = 'harness'
 # Claude Code slash commands shipped with ccx.
 COMMAND_FILES = ('fallback.md',)

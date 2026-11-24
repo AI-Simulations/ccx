@@ -460,11 +460,16 @@ class CcSessionTests(unittest.TestCase):
         adapter = f"http://127.0.0.1:{self.ccx.ADAPTER_PORT}/official"
         flag = "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL"
         self.assertIn(flag, self.ccx.CCX_VARS, "other routes clear a flag left by an official launch")
-        for env, expected in [({}, adapter), ({"CCX_OFFICIAL_DIRECT": "1"}, None)]:
-            with self.subTest(env=env), patch.dict(os.environ, {"CCX_OFFICIAL_DIRECT": "", **env}), \
+        # Anthropic's own host with the adapter as proxy keeps Code Mode; a proxy of the user's own stays theirs
+        named = self.ccx.OFFICIAL_BASES[1]
+        no_proxy = {v: "" for v in self.ccx.PROXY_VARS}
+        for env, expected in [({}, named), ({"HTTPS_PROXY": "http://proxy.example:8080"}, adapter),
+                              ({"CCX_OFFICIAL_DIRECT": "1"}, None)]:
+            with self.subTest(env=env), patch.dict(os.environ, {"CCX_OFFICIAL_DIRECT": "", **no_proxy, **env}), \
                     patch.object(self.ccx, "ensure_anthropic_proxy"):
                 got = self.ccx.route_env("official", None, passthrough=True)
             self.assertEqual(got.get("ANTHROPIC_BASE_URL"), expected)
+            self.assertEqual(got.get("HTTP_PROXY"), self.ccx.ADAPTER_URL if expected == named else None)
             # Claude Code keeps its first-party helpers (Haiku agent summaries) behind the adapter
             self.assertEqual(got.get(flag), "1" if expected else None)
 

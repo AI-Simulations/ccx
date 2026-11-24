@@ -1,0 +1,4 @@
+name: ccx-cmd
+version: 1.0.0
+description: "ccx's /ccx command: change this ccx launch's models (route, fallback, helpers, subagents) or open its model picker."
+author: ccx

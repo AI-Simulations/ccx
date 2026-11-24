@@ -140,11 +140,12 @@ two or more levels. Auto and Tools helpers need an adapter session; `--fallback`
 On a resume, subagent flags go over that session's own picks. Words after `--`, and every word of plain
 `claude`, go to Claude Code untouched (its own `--tools` and `--agent` included).
 
-### Other harnesses: pi, Hermes, opencode, Command Code
+### Other harnesses: pi, Hermes, opencode, Command Code, Codex, Antigravity CLI
 
-`ccx --harness <pi|hermes|opencode|commandcode> <provider> <model> [--effort E] [part flags] [-- harness arguments]`
+`ccx --harness <pi|hermes|opencode|commandcode|codex|agy> <provider> <model> [--effort E] [part flags] [-- harness arguments]`
 starts another agent CLI with the same parts: the provider's preset, then the flags above. Every model call goes
-through the adapter at `/ccx/<launch>/v1/messages`, where placeholder models name the part (`ccx-main`,
+through the adapter at `/ccx/<launch>/v1/messages` (Codex: `/v1/responses`; agy: `/v1/chat/completions`, both
+converted to and from the Messages format there), where placeholder models name the part (`ccx-main`,
 `ccx-live-<subagent or level>`, `ccx-auto`, `ccx-tools`) and the adapter swaps in this launch's picks, its keys and
 its fallback. The claude.ai login (`official`) serves Claude Code only, so it is refused there.
 
@@ -154,16 +155,26 @@ its fallback. The claude.ai login (`official`) serves Claude Code only, so it is
 | Hermes | `--provider ccx -m ccx-main` | `delegation` (one model) or the `ccx-router` plugin | `auxiliary.approval` | compaction, titles, MCP, memory | untouched: a `ccx<id>` Hermes profile per set of picks (your Hermes gateway serves profiles; a separate home cannot start beside it), reusing your skills; delete one with `hermes profile delete <name>` |
 | opencode | `agents.build.model` with the effort variant | one `ccx-<name>` subagent per profile or level | ccx's plugin judges what your rules allow or ask; your denies stay final | title, summary, compaction | merged over yours (`OPENCODE_CONFIG_CONTENT`, `--standalone`) |
 | Command Code | BYOK provider `ccx`, `--effort` | `ccx-<name>` agents | `--yolo` plus a PreToolUse hook asking the classifier on every tool | title, compaction, tool descriptions, branch summaries | untouched: a ccx-owned home per set of picks under `%LOCALAPPDATA%\ccx\homes` (`HOME`/`USERPROFILE`) that links back every folder and file of yours, your Command Code login, skills, mods and settings included; `--local-only` |
+| Codex | provider `ccx` on the Responses route, `-m ccx-main` | one agent role per profile or level (`agents.ccx-<name>`) | Codex's own reviewer (`approvals_reviewer = auto_review`), answered by the Auto pick | `/review`, memories, compaction | untouched (`-c` overrides per launch) |
+| agy | gateway mode (`AGY_LLM_GATEWAY_*`), `--model ccx-main` | every profile or level as a gateway model | agy's own | agy's own | untouched (environment per launch) |
 
 Launches with the same picks share one id (and one profile or home); other picks never rewrite a running
 session's. Those homes link to your own folders: never delete one with a tool that follows links. ccx does not
 clean them up: delete an old Hermes profile with `hermes profile delete ccx<id>`, and an old Command Code home by
-removing its links first. A launch's routes expire after 30 days; start the harness through ccx again to resume
+removing its links first. Codex role files live in `~/.config/ccx/codex`. A launch's routes expire after 30 days; start the harness through ccx again to resume
 on it.
 
 A part you leave unset keeps the harness's own behaviour (pi has no approvals; Hermes, opencode and Command Code
 their usual ones). In pi and opencode a `/model` pick inside the session is saved to your own settings as usual.
-Codex and the Antigravity CLI need OpenAI-format endpoints on the adapter first.
+Codex takes model names only from its own list, so each subagent profile or router level is a Codex agent role
+(`ccx-<name>`) and the `default` role is the one profile or the router's middle level. agy has no Auto or Tools
+model of its own to set.
+
+Inside a harness session, `/ccx` runs ccx on that session's launch with no model turn: alone it opens the model
+picker window, and `/ccx route <provider> <model>`, `/ccx fallback ...`, `/ccx helper auto|tools ...` and
+`/ccx agents ...` change that session's parts only. pi, Hermes, opencode and Command Code get `/ccx` from a ccx
+extension, plugin or mod loaded for the launch; Codex and agy cannot add slash commands, so there it is
+`!ccx ...` (a `ccx` command ccx puts first on the session's `PATH`, which a model's shell tool reaches too).
 
 ## Status line
 

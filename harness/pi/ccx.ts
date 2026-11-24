@@ -134,6 +134,22 @@ export default function (pi: ExtensionAPI) {
 		],
 	});
 
+	if (!process.env.CCX_PI_DEPTH) {
+		// /ccx: runs ccx on this launch with no model turn. Alone it opens ccx's model picker window;
+		// `/ccx route <provider> <model>`, `/ccx fallback ...`, `/ccx helper auto ...` change this session's parts.
+		pi.registerCommand("ccx", {
+			description: "ccx: this session's models (route, fallback, helpers, subagents, picker)",
+			handler: async (args, ctx) => {
+				// words, a quoted one kept whole
+				const words = (String(args ?? "").match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((w) => w.replace(/^(["'])(.*)\1$/, "$2"));
+				const result = await pi.exec(process.env.CCX_PYTHON || "python",
+					["-B", process.env.CCX_SWITCH || "ccx-switch.py", ...words], { timeout: 120000 });
+				const text = [result.stdout, result.stderr].map((t) => String(t ?? "").trim()).filter(Boolean).join("\n");
+				ctx.ui.notify(text || (result.code === 0 ? "Done." : "ccx failed."), result.code === 0 ? "info" : "error");
+			},
+		});
+	}
+
 	if (subagents.length) {
 		const names = subagents.map((s) => s.name) as [string, ...string[]];
 		const listing = subagents

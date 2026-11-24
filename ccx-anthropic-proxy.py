@@ -46,7 +46,7 @@ COOLDOWN = {}
 CLI_ROUTE = "commandcode-cli"
 # Google AI Pro answers through Google's Antigravity CLI: one `agy` run per request, text tool protocol.
 AGY_ROUTE = "antigravity-cli"
-IDENTITY = {"service": "ccx-anthropic-proxy", "version": 38}
+IDENTITY = {"service": "ccx-anthropic-proxy", "version": 39}
 # `ccx official` (plain claude) comes in under this route: passed to Anthropic as sent, login and all,
 # until /model routes its launch to another provider.
 OFFICIAL_ROUTE = "official"
@@ -1318,6 +1318,503 @@ def effort_supported(provider, model, effort):
     return bool(candidates & set(supported))
 
 
+# ---------------- OpenAI-format clients (Codex, Antigravity CLI) ----------------
+# Codex speaks the Responses API (POST /ccx/<launch>/v1/responses) and agy's gateway mode chat completions
+# (POST /ccx/<launch>/v1/chat/completions). Both become an Anthropic Messages request on this adapter's own
+# /ccx/<launch>/v1/messages route, so routing, keys, helpers and the fallback stay in one place; the Anthropic
+# stream that comes back is retold in the client's format.
+
+OPENAI_FRONTS = {("v1", "responses"): "responses", ("v1", "chat", "completions"): "chat"}
+NAMESPACE_JOIN = "__"
+# Codex's own side models, as the launch's parts: its approval reviewer is the Auto pick
+CODEX_PART_MODELS = {"codex-auto-review": "ccx-auto"}
+JSON_ANSWER = ("Answer with one JSON object and nothing else (no prose, no code fence). It must match this "
+               "JSON schema:\n")  # a Responses namespace tool `ns` + `name` travels as the Anthropic tool `ns__name`
+DEFAULT_MAX_TOKENS = 32000
+
+
+def _text_of(content):
+    """The text of an OpenAI content value: a string, or a list of text-like parts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p.get("text") or "" for p in content if isinstance(p, dict) and p.get("type") in
+                         ("text", "input_text", "output_text", "summary_text", "refusal") and p.get("text"))
+    return "" if content is None else str(content)
+
+
+def _image_block(url):
+    """An Anthropic image block for an OpenAI image URL (a data: URL or a plain one)."""
+    if not isinstance(url, str) or not url:
+        return None
+    match = re.match(r"data:([^;,]+);base64,(.*)", url, re.S)
+    if match:
+        return {"type": "image", "source": {"type": "base64", "media_type": match.group(1), "data": match.group(2)}}
+    return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def _parts(content):
+    """Anthropic content blocks for an OpenAI message's content."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    blocks = []
+    for part in content if isinstance(content, list) else []:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind in ("text", "input_text", "output_text") and part.get("text"):
+            blocks.append({"type": "text", "text": part["text"]})
+        elif kind in ("input_image", "image_url"):
+            url = part.get("image_url")
+            image = _image_block(url.get("url") if isinstance(url, dict) else url)
+            if image:
+                blocks.append(image)
+    return blocks
+
+
+def _arguments(raw):
+    """A tool call's arguments as the object Anthropic wants (unparsable text kept under `input`)."""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        value = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {"input": raw}
+    return value if isinstance(value, dict) else {"input": value}
+
+
+class _Conversation:
+    """Anthropic messages built in order, same-role neighbours merged (Anthropic alternates roles)."""
+
+    def __init__(self):
+        self.system, self.messages = [], []
+
+    def add(self, role, blocks):
+        blocks = [b for b in blocks if b]
+        if not blocks:
+            return
+        if self.messages and self.messages[-1]["role"] == role:
+            self.messages[-1]["content"] += blocks
+        else:
+            self.messages.append({"role": role, "content": blocks})
+
+    def answer_orphans(self):
+        """Gives every tool call that got no result a stub one (an interrupted turn): Anthropic refuses a
+        tool_use the next message does not answer."""
+        at = 0
+        while at < len(self.messages):
+            message, after = self.messages[at], self.messages[at + 1] if at + 1 < len(self.messages) else None
+            at += 1
+            if message["role"] != "assistant":
+                continue
+            answered = {b.get("tool_use_id") for b in (after or {}).get("content", ()) if b.get("type") == "tool_result"}
+            stubs = [{"type": "tool_result", "tool_use_id": b["id"], "content": "(no result: the call was interrupted)"}
+                     for b in message["content"] if b.get("type") == "tool_use" and b["id"] not in answered]
+            if stubs and after:
+                after["content"] = stubs + after["content"]
+            elif stubs:
+                self.messages.append({"role": "user", "content": stubs})
+
+    def body(self, model, max_tokens, tools, effort, stream=True):
+        self.answer_orphans()
+        if self.messages and self.messages[0]["role"] != "user":
+            self.messages.insert(0, {"role": "user", "content": [{"type": "text", "text": "(continue)"}]})
+        body = {"model": model or "ccx-main", "max_tokens": int(max_tokens or DEFAULT_MAX_TOKENS),
+                "messages": self.messages or [{"role": "user", "content": [{"type": "text", "text": "(empty)"}]}],
+                "stream": stream}
+        if self.system:
+            body["system"] = "\n\n".join(t for t in self.system if t)
+        if tools:
+            body["tools"] = tools
+        if effort:
+            body["output_config"] = {"effort": effort}
+        return body
+
+
+def _sent_name(namespace, name):
+    """The Anthropic tool name of a Responses tool: namespace and name joined, cut to the 64 characters a
+    tool name may have (a hash keeps cut names apart)."""
+    joined = (namespace + NAMESPACE_JOIN if namespace else "") + (name or "")
+    if len(joined) > 64:
+        import hashlib
+        joined = joined[:55] + "_" + hashlib.sha1(joined.encode()).hexdigest()[:8]
+    return joined
+
+
+def _openai_code(error):
+    """The OpenAI error code for an Anthropic error: the ones Codex acts on (retry, compaction)."""
+    kind, message = error.get("type") or "api_error", str(error.get("message") or "").lower()
+    if "prompt is too long" in message or "context length" in message or "context window" in message:
+        return "context_length_exceeded"
+    return {"rate_limit_error": "rate_limit_exceeded", "overloaded_error": "server_is_overloaded"}.get(kind, kind)
+
+
+def _function_tool(name, description, parameters):
+    schema = parameters if isinstance(parameters, dict) and parameters else {"type": "object", "properties": {}}
+    return {"name": name, "description": description or "", "input_schema": schema}
+
+
+def responses_request(body):
+    """An Anthropic Messages body for a Responses API request (Codex), the names of its freeform tools, and
+    the (namespace, name) of each tool sent under another name (_sent_name)."""
+    talk, custom, names, tools = _Conversation(), set(), {}, []
+    if body.get("instructions"):
+        talk.system.append(_text_of(body["instructions"]))
+    for tool in body.get("tools") or ():
+        kind = tool.get("type")
+        if kind == "function":
+            sent = _sent_name(None, tool["name"])
+            if sent != tool["name"]:
+                names[sent] = (None, tool["name"])
+            tools.append(_function_tool(sent, tool.get("description"), tool.get("parameters")))
+        elif kind == "namespace":
+            for inner in tool.get("tools") or ():
+                if inner.get("type") == "function":
+                    sent = _sent_name(tool["name"], inner["name"])
+                    names[sent] = (tool["name"], inner["name"])
+                    tools.append(_function_tool(sent, inner.get("description"), inner.get("parameters")))
+        elif kind == "custom":
+            custom.add(tool["name"])
+            grammar = (tool.get("format") or {}).get("definition") or ""
+            tools.append(_function_tool(tool["name"], (tool.get("description") or "")
+                                        + ("\n\nThe input follows this grammar:\n" + grammar if grammar else ""),
+                                        {"type": "object", "properties": {"input": {"type": "string"}},
+                                         "required": ["input"]}))
+        # built-in tools (web_search, image_generation, local_shell) need OpenAI's servers: left out
+    items = body.get("input")
+    items = [{"type": "message", "role": "user", "content": items}] if isinstance(items, str) else items or []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type") or ("message" if item.get("role") else None)
+        if kind == "message":
+            role = item.get("role")
+            if role in ("system", "developer"):
+                talk.system.append(_text_of(item.get("content")))
+            elif role == "assistant":
+                talk.add("assistant", [b for b in _parts(item.get("content")) if b["type"] == "text"])
+            else:
+                talk.add("user", _parts(item.get("content")))
+        elif kind == "function_call":
+            talk.add("assistant", [{"type": "tool_use", "id": item.get("call_id") or item.get("id") or "call",
+                                    "name": _sent_name(item.get("namespace"), item.get("name") or ""),
+                                    "input": _arguments(item.get("arguments"))}])
+        elif kind == "custom_tool_call":
+            talk.add("assistant", [{"type": "tool_use", "id": item.get("call_id") or item.get("id") or "call",
+                                    "name": item.get("name") or "", "input": {"input": item.get("input") or ""}}])
+        elif kind in ("function_call_output", "custom_tool_call_output"):
+            output = item.get("output")  # text, or parts (view_image answers with an image)
+            content = _parts(output) if isinstance(output, list) else _text_of(output)
+            talk.add("user", [{"type": "tool_result", "tool_use_id": item.get("call_id") or "call",
+                               "content": content or "(no output)"}])
+        # reasoning items carry no signature another provider could verify: dropped, as is OpenAI-only state
+    form = (body.get("text") or {}).get("format") or {}
+    if form.get("type") == "json_schema":
+        talk.system.append(JSON_ANSWER + json.dumps(form.get("schema") or {}))
+    elif form.get("type") == "json_object":
+        talk.system.append(JSON_ANSWER + "{}")
+    effort = (body.get("reasoning") or {}).get("effort")
+    model = CODEX_PART_MODELS.get(body.get("model"), body.get("model"))
+    anthropic = talk.body(model, body.get("max_output_tokens"), tools, effort, stream=True)
+    choice = body.get("tool_choice")
+    if choice == "required":
+        anthropic["tool_choice"] = {"type": "any"}
+    elif choice == "none":
+        anthropic.pop("tools", None)
+    elif isinstance(choice, dict) and choice.get("type") in ("function", "custom") and choice.get("name") and tools:
+        anthropic["tool_choice"] = {"type": "tool", "name": _sent_name(choice.get("namespace"), choice["name"])}
+    return anthropic, custom, names
+
+
+def chat_request(body):
+    """An Anthropic Messages body for a chat completions request (agy's gateway mode)."""
+    talk, tools = _Conversation(), []
+    for tool in body.get("tools") or ():
+        function = tool.get("function") if tool.get("type") == "function" else None
+        if function and function.get("name"):
+            tools.append(_function_tool(function["name"], function.get("description"), function.get("parameters")))
+    for message in body.get("messages") or ():
+        role = message.get("role")
+        if role in ("system", "developer"):
+            talk.system.append(_text_of(message.get("content")))
+        elif role == "assistant":
+            blocks = [b for b in _parts(message.get("content")) if b["type"] == "text"]
+            for call in message.get("tool_calls") or ():
+                function = call.get("function") or {}
+                blocks.append({"type": "tool_use", "id": call.get("id") or "call", "name": function.get("name") or "",
+                               "input": _arguments(function.get("arguments"))})
+            talk.add("assistant", blocks)
+        elif role == "tool":
+            talk.add("user", [{"type": "tool_result", "tool_use_id": message.get("tool_call_id") or "call",
+                               "content": _text_of(message.get("content")) or "(no output)"}])
+        else:
+            talk.add("user", _parts(message.get("content")))
+    form = body.get("response_format") or {}
+    if form.get("type") == "json_schema":
+        talk.system.append(JSON_ANSWER + json.dumps((form.get("json_schema") or {}).get("schema") or {}))
+    elif form.get("type") == "json_object":
+        talk.system.append(JSON_ANSWER + "{}")
+    max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
+    anthropic = talk.body(body.get("model"), max_tokens, tools, body.get("reasoning_effort"), stream=True)
+    choice = body.get("tool_choice")
+    if choice == "required":
+        anthropic["tool_choice"] = {"type": "any"}
+    elif choice == "none":
+        anthropic.pop("tools", None)
+    elif isinstance(choice, dict) and (choice.get("function") or {}).get("name") and tools:
+        anthropic["tool_choice"] = {"type": "tool", "name": choice["function"]["name"]}
+    return anthropic
+
+
+def anthropic_sse(response):
+    """The events of an Anthropic Messages stream, as dicts."""
+    data = []
+    for raw in response:
+        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+        if line.startswith("data:"):
+            data.append(line[5:].lstrip())
+        elif not line and data:
+            try:
+                yield json.loads("\n".join(data))
+            except ValueError:
+                pass
+            data = []
+    if data:
+        try:
+            yield json.loads("\n".join(data))
+        except ValueError:
+            pass
+
+
+def _usage(start, delta):
+    """Input and output token counts from message_start and message_delta usage."""
+    used = {**(start or {}), **{k: v for k, v in (delta or {}).items() if v is not None}}
+    fresh = used.get("input_tokens") or 0
+    cached = (used.get("cache_read_input_tokens") or 0)
+    written = used.get("cache_creation_input_tokens") or 0
+    return fresh + cached + written, cached, used.get("output_tokens") or 0
+
+
+STOP_TO_FINISH = {"end_turn": "stop", "stop_sequence": "stop", "tool_use": "tool_calls", "max_tokens": "length",
+                  "refusal": "content_filter"}
+
+
+def json_answer(text):
+    """The JSON object in a model's answer to a JSON-only request (a code fence or a preamble removed)."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < start:
+        return text
+    try:
+        return json.dumps(json.loads(text[start:end + 1]))
+    except ValueError:
+        return text
+
+
+def responses_events(events, model, custom=(), json_mode=False, names=None):
+    """Retells an Anthropic stream as Responses API events (what Codex reads). Ends with response.completed
+    (response.incomplete when the output limit cut it), or response.failed on an error or a stream that
+    stopped early: Codex retries a stream left open.
+    json_mode: the request asked for JSON only; its text goes out whole, cleaned to the JSON object.
+    names: responses_request's renamed tools, to give each call its own name and namespace back."""
+    rid = "resp_" + uuid.uuid4().hex
+    shell = {"id": rid, "object": "response", "created_at": int(time.time()), "model": model}
+    yield {"type": "response.created", "response": {**shell, "status": "in_progress", "output": []}}
+    output, open_blocks, start_usage, delta_usage, finished, stop = [], {}, {}, {}, False, None
+    for event in events:
+        kind = event.get("type")
+        if kind == "message_start":
+            start_usage = (event.get("message") or {}).get("usage") or {}
+        elif kind == "content_block_start":
+            block, index = event.get("content_block") or {}, event.get("index", 0)
+            position = len(output) + len(open_blocks)
+            if block.get("type") == "text":
+                item = {"type": "message", "id": "msg_" + uuid.uuid4().hex, "role": "assistant",
+                        "status": "in_progress", "content": []}
+                state = {"item": item, "text": block.get("text") or "", "at": position}
+                yield {"type": "response.output_item.added", "output_index": position, "item": item}
+                yield {"type": "response.content_part.added", "item_id": item["id"], "output_index": position,
+                       "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}
+            elif block.get("type") in ("thinking", "redacted_thinking"):
+                item = {"type": "reasoning", "id": "rs_" + uuid.uuid4().hex, "summary": []}
+                state = {"item": item, "text": block.get("thinking") or "", "at": position}
+                yield {"type": "response.output_item.added", "output_index": position, "item": item}
+            elif block.get("type") == "tool_use":
+                name = block.get("name") or ""
+                if name in custom:
+                    item = {"type": "custom_tool_call", "id": "ctc_" + uuid.uuid4().hex,
+                            "call_id": block.get("id") or "call_" + uuid.uuid4().hex, "name": name,
+                            "status": "in_progress", "input": ""}
+                else:
+                    item = {"type": "function_call", "id": "fc_" + uuid.uuid4().hex,
+                            "call_id": block.get("id") or "call_" + uuid.uuid4().hex, "name": name,
+                            "status": "in_progress", "arguments": ""}
+                    if name in (names or {}):
+                        namespace, item["name"] = names[name]
+                        if namespace:
+                            item["namespace"] = namespace
+                state = {"item": item, "text": json.dumps(block["input"]) if block.get("input") else "", "at": position}
+                yield {"type": "response.output_item.added", "output_index": position, "item": item}
+            else:
+                continue
+            open_blocks[index] = state
+        elif kind == "content_block_delta":
+            state, delta = open_blocks.get(event.get("index", 0)), event.get("delta") or {}
+            if not state:
+                continue
+            item = state["item"]
+            if delta.get("type") == "text_delta" and delta.get("text"):
+                state["text"] += delta["text"]
+                if json_mode:
+                    continue
+                yield {"type": "response.output_text.delta", "item_id": item["id"], "output_index": state["at"],
+                       "content_index": 0, "delta": delta["text"]}
+            elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
+                state["text"] += delta["thinking"]
+                yield {"type": "response.reasoning_summary_text.delta", "item_id": item["id"],
+                       "output_index": state["at"], "summary_index": 0, "delta": delta["thinking"]}
+            elif delta.get("type") == "input_json_delta":
+                state["text"] += delta.get("partial_json") or ""
+        elif kind == "content_block_stop":
+            state = open_blocks.pop(event.get("index", 0), None)
+            if not state:
+                continue
+            item = state["item"]
+            if item["type"] == "message":
+                if json_mode:
+                    state["text"] = json_answer(state["text"])
+                    yield {"type": "response.output_text.delta", "item_id": item["id"], "output_index": state["at"],
+                           "content_index": 0, "delta": state["text"]}
+                part = {"type": "output_text", "text": state["text"], "annotations": []}
+                yield {"type": "response.output_text.done", "item_id": item["id"], "output_index": state["at"],
+                       "content_index": 0, "text": state["text"]}
+                yield {"type": "response.content_part.done", "item_id": item["id"], "output_index": state["at"],
+                       "content_index": 0, "part": part}
+                item = {**item, "status": "completed", "content": [part]}
+            elif item["type"] == "reasoning":
+                item = {**item, "summary": [{"type": "summary_text", "text": state["text"]}] if state["text"] else [],
+                        "encrypted_content": None}
+            elif item["type"] == "custom_tool_call":
+                item = {**item, "status": "completed", "input": _arguments(state["text"] or "{}").get("input", "")}
+            else:
+                item = {**item, "status": "completed", "arguments": state["text"] or "{}"}
+            output.append(item)
+            yield {"type": "response.output_item.done", "output_index": state["at"], "item": item}
+        elif kind == "message_delta":
+            delta_usage = event.get("usage") or {}
+            stop = (event.get("delta") or {}).get("stop_reason") or stop
+        elif kind == "message_stop":
+            finished = True
+            break
+        elif kind == "error":
+            error = event.get("error") or {}
+            yield {"type": "response.failed", "response": {**shell, "status": "failed", "output": output,
+                   "error": {"code": _openai_code(error), "message": error.get("message") or "Upstream error"}}}
+            return
+    if not finished:
+        yield {"type": "response.failed", "response": {**shell, "status": "failed", "output": output,
+               "error": {"code": "stream_ended", "message": "The model's stream ended before it finished."}}}
+        return
+    total_in, cached, total_out = _usage(start_usage, delta_usage)
+    cut = stop == "max_tokens"  # the output limit: not a finished answer
+    yield {"type": "response.incomplete" if cut else "response.completed", "response": {
+        **shell, "status": "incomplete" if cut else "completed", "output": output,
+        **({"incomplete_details": {"reason": "max_output_tokens"}} if cut else {}), "usage": {
+            "input_tokens": total_in, "input_tokens_details": {"cached_tokens": cached},
+            "output_tokens": total_out, "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": total_in + total_out}}}
+
+
+def chat_chunks(events, model, include_usage=False):
+    """Retells an Anthropic stream as chat completion chunks (what agy's gateway mode reads)."""
+    cid = "chatcmpl-" + uuid.uuid4().hex
+    created = int(time.time())
+    chunk = lambda delta, finish=None: {"id": cid, "object": "chat.completion.chunk", "created": created,
+                                        "model": model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+    yield chunk({"role": "assistant", "content": ""})
+    calls, start_usage, delta_usage, stop, finished = {}, {}, {}, None, False
+    for event in events:
+        kind = event.get("type")
+        if kind == "message_start":
+            start_usage = (event.get("message") or {}).get("usage") or {}
+        elif kind == "content_block_start":
+            block = event.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                at = calls[event.get("index", 0)] = len(calls)
+                yield chunk({"tool_calls": [{"index": at, "id": block.get("id") or "call_" + uuid.uuid4().hex,
+                                             "type": "function", "function": {"name": block.get("name") or "",
+                                                                              "arguments": ""}}]})
+            elif block.get("type") == "text" and block.get("text"):
+                yield chunk({"content": block["text"]})
+        elif kind == "content_block_delta":
+            delta = event.get("delta") or {}
+            if delta.get("type") == "text_delta" and delta.get("text"):
+                yield chunk({"content": delta["text"]})
+            elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
+                yield chunk({"reasoning_content": delta["thinking"]})
+            elif delta.get("type") == "input_json_delta" and event.get("index", 0) in calls:
+                yield chunk({"tool_calls": [{"index": calls[event.get("index", 0)],
+                                             "function": {"arguments": delta.get("partial_json") or ""}}]})
+        elif kind == "message_delta":
+            delta_usage = event.get("usage") or {}
+            stop = (event.get("delta") or {}).get("stop_reason") or stop
+        elif kind == "message_stop":
+            finished = True
+            break
+        elif kind == "error":
+            error = event.get("error") or {}
+            yield {"error": {"type": error.get("type") or "api_error", "message": error.get("message") or "Upstream error"}}
+            return
+    if not finished:  # a stream cut short is not a finished answer
+        yield {"error": {"type": "api_error", "message": "The model's stream ended before it finished."}}
+        return
+    yield chunk({}, STOP_TO_FINISH.get(stop, "tool_calls" if calls else "stop"))
+    if include_usage:
+        total_in, cached, total_out = _usage(start_usage, delta_usage)
+        yield {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model, "choices": [],
+               "usage": {"prompt_tokens": total_in, "completion_tokens": total_out, "total_tokens": total_in + total_out,
+                         "prompt_tokens_details": {"cached_tokens": cached}}}
+
+
+def chat_completion(chunks):
+    """One chat.completion object from chat_chunks (a client that did not ask to stream)."""
+    text, reasoning, calls, finish, usage_row, model, cid = "", "", {}, "stop", None, "", ""
+    for chunk in chunks:
+        if "error" in chunk:
+            raise UpstreamFailure(chunk["error"].get("message") or "Upstream error")
+        cid, model = chunk.get("id", cid), chunk.get("model", model)
+        usage_row = chunk.get("usage") or usage_row
+        for choice in chunk.get("choices") or ():
+            delta = choice.get("delta") or {}
+            text += delta.get("content") or ""
+            reasoning += delta.get("reasoning_content") or ""
+            for call in delta.get("tool_calls") or ():
+                row = calls.setdefault(call["index"], {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                row["id"] = call.get("id") or row["id"]
+                row["function"]["name"] += (call.get("function") or {}).get("name") or ""
+                row["function"]["arguments"] += (call.get("function") or {}).get("arguments") or ""
+            finish = choice.get("finish_reason") or finish
+    message = {"role": "assistant", "content": text or None}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if calls:
+        message["tool_calls"] = [calls[i] for i in sorted(calls)]
+    return {"id": cid, "object": "chat.completion", "created": int(time.time()), "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": finish}], **({"usage": usage_row} if usage_row else {})}
+
+
+class UpstreamFailure(Exception):
+    """The model's stream reported an error (shown to the client as is)."""
+    public = True
+
+
+def codex_request_kind(headers):
+    """Codex's x-codex-turn-metadata request kind ("turn", "compaction", ...), or ''."""
+    try:
+        return str(json.loads(headers.get("x-codex-turn-metadata") or "{}").get("request_kind") or "")
+    except (ValueError, AttributeError):
+        return ""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # Never log prompts or credentials.
@@ -1486,6 +1983,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             route = urllib.parse.urlsplit(self.path).path.strip("/").split("/")
             harness_launch = None
+            if route[0] == HARNESS_ROUTE and len(route) > 2 and tuple(route[2:]) in OPENAI_FRONTS \
+                    and HARNESS_LAUNCH.fullmatch(route[1]):
+                self.answer_openai(route[1], OPENAI_FRONTS[tuple(route[2:])])
+                return
             if route[0] == HARNESS_ROUTE:
                 if len(route) != 4 or route[2:] != ["v1", "messages"] or not HARNESS_LAUNCH.fullmatch(route[1]):
                     self.send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": "Not found"}})
@@ -1629,6 +2130,87 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(("event: error\ndata: " + json.dumps(error) + "\n\n").encode())
             else:
                 self.send_json(status, error, headers=response_headers)
+
+    def answer_openai(self, launch, front):
+        """Codex (front "responses") or agy (front "chat") on harness launch `launch`: the request runs as an
+        Anthropic Messages request on this adapter's own harness route, and the reply is retold (OPENAI_FRONTS)."""
+        if self.headers.get("Origin"):
+            self.send_json(403, {"error": {"type": "forbidden", "message": "Browser requests are not allowed"}})
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        if not 0 < length <= 32 * 1024 * 1024:
+            raise ValueError("Invalid request size (maximum 32 MiB)")
+        body = json.loads(self.rfile.read(length))
+        custom = ()
+        if front == "responses":
+            anthropic, custom, names = responses_request(body)
+            if codex_request_kind(self.headers) == "compaction":
+                anthropic["model"] = "ccx-tools"  # Codex's own compaction is a side task: the Tools model, else main
+        else:
+            anthropic = chat_request(body)
+        model = body.get("model") or "ccx-main"
+        key = self.headers.get("Authorization", "").removeprefix("Bearer ").strip() or "ccx-local"
+        request = urllib.request.Request(f"http://127.0.0.1:{self.server.server_port}/{HARNESS_ROUTE}/{launch}/v1/messages",
+                                         data=json.dumps(anthropic).encode(),
+                                         headers={"Content-Type": "application/json", "x-api-key": key})
+        try:
+            response = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=900)
+        except urllib.error.HTTPError as exc:
+            try:
+                error = json.loads(exc.read()).get("error") or {}
+            except ValueError:
+                error = {}
+            headers = {k: exc.headers[k] for k in ("retry-after",) if exc.headers.get(k)}
+            self.send_json(exc.code, {"error": {"type": error.get("type") or "api_error", "code": _openai_code(error),
+                                                "message": error.get("message") or f"HTTP {exc.code}"}}, headers=headers)
+            return
+        with response:
+            events = anthropic_sse(response)
+            if front == "responses":
+                form = ((body.get("text") or {}).get("format") or {}).get("type")
+                stream = responses_events(events, model, custom, json_mode=form in ("json_schema", "json_object"),
+                                          names=names)
+            else:
+                stream = chat_chunks(events, model, bool((body.get("stream_options") or {}).get("include_usage")))
+            if not body.get("stream"):
+                if front == "chat":
+                    self.send_json(200, chat_completion(stream))
+                    return
+                final = None
+                for event in stream:
+                    final = event.get("response") if event["type"] in (
+                        "response.completed", "response.incomplete", "response.failed") else final
+                if final and final.get("status") != "failed":
+                    self.send_json(200, final)
+                else:
+                    self.send_json(502, {"error": (final or {}).get("error") or {"code": "api_error",
+                                                                                 "message": "No response"}})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                for event in stream:
+                    if front == "responses":
+                        self.wfile.write(("event: " + event["type"] + "\ndata: " + json.dumps(event) + "\n\n").encode())
+                    else:
+                        self.wfile.write(("data: " + json.dumps(event) + "\n\n").encode())
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as exc:  # the stream has started: the failure travels inside it
+                message = f"Adapter stream failed ({type(exc).__name__})."
+                if front == "responses":
+                    failure = {"type": "response.failed", "response": {"id": "resp_failed", "status": "failed",
+                                                                       "error": {"code": "api_error", "message": message}}}
+                    self.wfile.write(("event: response.failed\ndata: " + json.dumps(failure) + "\n\n").encode())
+                else:
+                    self.wfile.write(("data: " + json.dumps({"error": {"type": "api_error", "message": message}}) + "\n\n").encode())
+                return
+            if front == "chat":
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
 
     def answer_cli(self, body, agy=False):
         """Streams Command Code's reply as it arrives, with pings while it is quiet: straight from
