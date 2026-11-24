@@ -46,10 +46,15 @@ COOLDOWN = {}
 CLI_ROUTE = "commandcode-cli"
 # Google AI Pro answers through Google's Antigravity CLI: one `agy` run per request, text tool protocol.
 AGY_ROUTE = "antigravity-cli"
-IDENTITY = {"service": "ccx-anthropic-proxy", "version": 37}
+IDENTITY = {"service": "ccx-anthropic-proxy", "version": 38}
 # `ccx official` (plain claude) comes in under this route: passed to Anthropic as sent, login and all,
 # until /model routes its launch to another provider.
 OFFICIAL_ROUTE = "official"
+# Other harnesses (pi, Hermes, ...) post to /ccx/<launch>/v1/messages: the path names their launch, and the
+# model names the part: ccx-auto / ccx-tools the helpers, ccx-live-<profile> a subagent, anything else the main model.
+HARNESS_ROUTE = "ccx"
+HARNESS_LAUNCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+HARNESS_HELPERS = {"ccx-auto": "auto", "ccx-tools": "tools"}
 OFFICIAL_UPSTREAM = "https://api.anthropic.com"
 # `ccx official` sets ANTHROPIC_BASE_URL to this host (Claude Code keeps Code Mode only for it) and HTTP_PROXY
 # to the adapter, so its requests arrive here with the full URL.
@@ -1260,6 +1265,15 @@ def helper_target(launch, kind, current):
     return target
 
 
+def harness_target(launch, model):
+    """The target a harness launch's placeholder `model` names (see HARNESS_ROUTE): a subagent profile,
+    else the main model. The helpers (HARNESS_HELPERS) start from the main model on the helper path."""
+    main = route_for(launch)
+    if not main:
+        raise ValueError(f"No ccx launch '{launch}': start this harness with `ccx --harness ...` again.")
+    return live_target(model, launch) or main
+
+
 def fit_thinking(body):
     """Drop `thinking: disabled` when the effort is xhigh/max: Claude rejects that pair with a 400 (Haiku 5.5,
     Opus 5), and omitting `thinking` runs adaptive. Claude Code sends helpers with thinking disabled."""
@@ -1471,13 +1485,20 @@ class Handler(BaseHTTPRequestHandler):
         streaming = False
         try:
             route = urllib.parse.urlsplit(self.path).path.strip("/").split("/")
+            harness_launch = None
+            if route[0] == HARNESS_ROUTE:
+                if len(route) != 4 or route[2:] != ["v1", "messages"] or not HARNESS_LAUNCH.fullmatch(route[1]):
+                    self.send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": "Not found"}})
+                    return
+                harness_launch, route = route[1], [HARNESS_ROUTE, "v1", "messages"]
             if route[0] == OFFICIAL_ROUTE and route[1:] != ["v1", "messages"]:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 <= length <= 32 * 1024 * 1024:
                     raise ValueError("Invalid request size (maximum 32 MiB)")
                 self.forward_official("POST", self.rfile.read(length) if length else b"")
                 return
-            if len(route) != 3 or route[0] not in (*UPSTREAMS, CLI_ROUTE, AGY_ROUTE, OFFICIAL_ROUTE) or route[1:] != ["v1", "messages"]:
+            if len(route) != 3 or route[0] not in (*UPSTREAMS, CLI_ROUTE, AGY_ROUTE, OFFICIAL_ROUTE, HARNESS_ROUTE) \
+                    or route[1:] != ["v1", "messages"]:
                 self.send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": "Not found"}})
                 return
             if self.headers.get("Origin"):
@@ -1488,12 +1509,18 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Invalid request size (maximum 32 MiB)")
             raw = self.rfile.read(length)
             body = json.loads(raw)
-            kind = helper_kind(body, self.headers.get("x-claude-code-request-class"))
-            if not kind and self.headers.get("x-ccx-worker-profile"):
-                live_worker_effort(body, self.headers["x-ccx-worker-profile"])
-            launch = self.headers.get("x-ccx-launch")
-            # All model-backed helpers follow the effective provider, not the launch's /official URL.
-            override = live_target(body.get("model"), launch) or route_for(launch)
+            if harness_launch:
+                # a helper placeholder takes the helper path below, exactly as Claude Code's helpers do
+                launch, harness_main = harness_launch, harness_target(harness_launch, None)
+                kind = HARNESS_HELPERS.get(body.get("model"))
+                override = harness_main if kind else harness_target(launch, body.get("model"))
+            else:
+                kind = helper_kind(body, self.headers.get("x-claude-code-request-class"))
+                if not kind and self.headers.get("x-ccx-worker-profile"):
+                    live_worker_effort(body, self.headers["x-ccx-worker-profile"])
+                launch = self.headers.get("x-ccx-launch")
+                # All model-backed helpers follow the effective provider, not the launch's /official URL.
+                override = live_target(body.get("model"), launch) or route_for(launch)
             if kind:
                 current = override or ({"provider": route[0], "model": body.get("model"), "effort": None,
                                        "format": "chat"} if route[0] != OFFICIAL_ROUTE else None)
@@ -1503,7 +1530,7 @@ class Handler(BaseHTTPRequestHandler):
                     override = None
                     body["model"] = selected["model"]
                 else:
-                    override = selected
+                    override = selected or (harness_main if harness_launch else None)
                 if selected and selected["provider"] != "official":
                     # Auto effort is independent; Tools falls back to the main request's effort.
                     if body.get("output_config") and (kind != "tools" or selected.get("effort")):
@@ -1519,6 +1546,9 @@ class Handler(BaseHTTPRequestHandler):
                     body["output_config"] = {**(body.get("output_config") or {}), "effort": override["effort"]}
                 fit_thinking(body)
                 if override["format"] == "official":
+                    if harness_launch:
+                        raise ValueError("Claude official (the claude.ai login) serves Claude Code only; "
+                                         "pick another provider for this part.")
                     if route[0] != OFFICIAL_ROUTE:
                         raise ValueError("Claude official needs a session started with `ccx official`.")
                     self.forward_official("POST", json.dumps(body).encode())

@@ -523,6 +523,266 @@ class CcSessionTests(unittest.TestCase):
                     self.ccx.helper_command(words)
         self.assertEqual(self.ccx.load_routes(), {})
 
+    def test_presets_set_edits_one_part_at_a_time(self):
+        ccx = self.ccx
+        ccx.model_efforts = lambda provider, model: None
+        ccx.load_state = lambda: {}  # never the person's own recent picks
+        levels = {"easy": {"provider": "official", "model": "claude-haiku-5-5", "upto": 60},
+                  "hard": {"provider": "official", "model": "claude-opus-5-5"}}
+        Path(ccx.AGENTS_FILE).write_text(json.dumps({**self.global_agents, **levels}), encoding="utf-8")
+        run = lambda *words: ccx.presets_command(["set", *words])
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "", "CLAUDECODE": "", "CCX_MAIN_PROVIDER": ""}), \
+                patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):  # a new named preset needs its main model first
+                run("mine", "auto", "openai-oauth", "gpt-6-luna")
+            run("mine", "main", "official", "claude-opus-5-5", "high")
+            run("mine", "auto", "openai-oauth", "gpt-6-luna", "low")
+            run("mine", "tools", "off")
+            run("mine", "fallback", "nvidia", "deepseek-ai/x")
+            bundle = ccx.saved_bundle("mine")
+            self.assertEqual(bundle["model"], {"provider": "official", "model": "claude-opus-5-5", "effort": "high"})
+            self.assertEqual(bundle["auto"], {"provider": "openai-oauth", "model": "gpt-6-luna", "effort": "low"})
+            self.assertEqual(bundle["tools"], {"provider": "off"})
+            self.assertEqual(bundle["fallback"], {"provider": "nvidia", "model": "deepseek-ai/x"})
+            self.assertEqual(bundle["subagent"]["provider"], "router", "a new preset starts on the router levels")
+            run("mine", "subagent", "official", "claude-sonnet-5-5", "medium")
+            self.assertEqual(ccx.saved_bundle("mine")["subagent"],
+                             {"provider": "official", "model": "claude-sonnet-5-5", "effort": "medium"})
+            self.assertEqual(ccx.saved_bundle("mine")["auto"]["model"], "gpt-6-luna", "other parts stay")
+            run("mine", "subagent", "router")
+            run("mine", "level", "mid", "official", "claude-sonnet-5-5", "high")
+            sub = ccx.saved_bundle("mine")["subagent"]
+            self.assertEqual(list(sub["levels"]), ["easy", "mid", "hard"])
+            self.assertEqual(sub["levels"]["mid"], {"provider": "official", "model": "claude-sonnet-5-5",
+                                                    "effort": "high", "upto": 89})
+            run("mine", "ranges", "30", "70")
+            sub = ccx.saved_bundle("mine")["subagent"]
+            self.assertEqual([sub["levels"][n].get("upto") for n in ("easy", "mid", "hard")], [30, 70, None])
+            run("mine", "level", "mid", "off")
+            self.assertEqual(list(ccx.saved_bundle("mine")["subagent"]["levels"]), ["easy", "hard"])
+            for bad in (["mine", "ranges", "70", "80"], ["mine", "ranges", "x"], ["mine", "level", "hard", "off"],
+                        ["mine", "auto", "nowhere", "m"], ["mine", "level", "huge", "official", "m"],
+                        ["mine", "main", "official", "../bad"], ["mine", "fallback", "official", "m"]):
+                with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                    run(*bad)
+            self.assertEqual(list(ccx.saved_bundle("mine")["subagent"]["levels"]), ["easy", "hard"], "rejected edits change nothing")
+            # a provider preset starts from what the picker shows for it
+            run("official", "auto", "openai-oauth", "gpt-6-luna")
+            self.assertEqual(ccx.saved_bundle("official")["model"]["model"], "claude-opus-5-5")
+            self.assertEqual(ccx.saved_bundle("official")["auto"]["model"], "gpt-6-luna")
+            run("official", "claude-sonnet-5-5", "high")  # the old main-model form keeps the other parts
+            self.assertEqual(ccx.saved_bundle("official")["auto"]["model"], "gpt-6-luna")
+            self.assertEqual(ccx.saved_bundle("official")["model"], {"provider": "official", "model": "claude-sonnet-5-5",
+                                                                     "effort": "high"}, "and the bundle's main model follows")
+
+    def test_launch_flags_set_each_part_for_this_launch(self):
+        ccx = self.ccx
+        ccx.model_efforts = lambda provider, model: None
+        argv = ["ccx", "openai-oauth", "gpt-6.1-sol", "--auto-model", "openai-oauth/gpt-6-luna@low", "--tools-model", "off",
+                "--subagent", "router", "--level", "easy=official/claude-haiku-5-5@max", "--level=hard=official/claude-opus-5-5",
+                "--fallback", "nvidia/deepseek-ai/x@high", "--verbose"]
+        with patch.object(ccx.sys, "argv", argv), patch.object(ccx, "APPLY_FILE", str(Path(self.tmp.name) / "apply.ps1")), \
+                patch.object(ccx, "quit_on_ctrl_c"), patch.object(ccx, "apply") as apply:
+            ccx.main()
+        kw = apply.call_args.kwargs
+        self.assertEqual(kw["claude_args"], ["--verbose"])
+        self.assertEqual(kw["fallback"], {"provider": "nvidia", "model": "deepseek-ai/x", "effort": "high"})
+        self.assertEqual(kw["overrides"], {
+            "auto": {"provider": "openai-oauth", "model": "gpt-6-luna", "effort": "low"}, "tools": "off",
+            "subagent": "router", "levels": {"easy": {"provider": "official", "model": "claude-haiku-5-5", "effort": "max"},
+                                             "hard": {"provider": "official", "model": "claude-opus-5-5"}}})
+        for bad in (["--auto-model", "nvidia"], ["--auto-model", "nowhere/m"], ["--level", "huge=official/m"], ["--level", "easy"],
+                    ["--fallback", "official/m"], ["--fallback", "openai-oauth/m"]):
+            with self.subTest(bad=bad), patch.object(ccx.sys, "argv", ["ccx", "openai-oauth", "m", *bad]), \
+                    patch.object(ccx, "quit_on_ctrl_c"), patch.object(ccx, "apply") as apply, \
+                    patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+                ccx.main()
+        # applied: helpers on the launch's route row, subagents in its session entry, global profiles untouched
+        providers = list(ccx.PROVIDERS)
+        ccx.apply_overrides("launch-a", kw["overrides"], adapter=True, providers=providers)
+        self.assertEqual(ccx.load_routes()["launch-a"]["helpers"], {"auto": kw["overrides"]["auto"]})
+        agents = ccx.load_agents()
+        self.assertEqual((agents["easy"]["model"], agents["easy"]["effort"]), ("claude-haiku-5-5", "max"))
+        self.assertTrue(agents["easy"]["description"])
+        self.assertTrue(ccx.router_on())
+        self.assertEqual(json.loads(Path(ccx.AGENTS_FILE).read_text()), self.global_agents)
+        ccx.apply_overrides("launch-a", {"subagent": {"provider": "nvidia", "model": "deepseek-ai/x"}, "tools": "off"},
+                            adapter=True, providers=providers)
+        self.assertEqual(ccx.load_agents()["sub"]["model"], "deepseek-ai/x")
+        self.assertFalse(ccx.router_on(), "one subagent model turns the router off")
+        self.assertNotIn("tools", ccx.load_routes()["launch-a"]["helpers"])
+        ccx.apply_overrides("launch-a", {"subagent": "off"}, adapter=True, providers=providers)
+        self.assertTrue(ccx.subagents_off())
+        with self.assertRaises(SystemExit), patch("sys.stderr", new_callable=io.StringIO):
+            ccx.apply_overrides("launch-a", {"auto": kw["overrides"]["auto"]}, adapter=False, providers=[])
+
+    def run_main(self, *words):
+        ccx = self.ccx
+        with patch.object(ccx.sys, "argv", ["ccx", *words]), patch.object(ccx, "quit_on_ctrl_c"), \
+                patch.object(ccx, "APPLY_FILE", str(Path(self.tmp.name) / "apply.ps1")), \
+                patch.object(ccx, "apply") as apply:
+            ccx.main()
+        return apply.call_args
+
+    def test_launch_flags_leave_claudes_own_flags_alone(self):
+        self.ccx.model_efforts = lambda provider, model: None
+        call = self.run_main("openai-oauth", "m", "--tools", "Read,Edit", "--tools-model", "off", "--agent", "x")
+        self.assertEqual(call.kwargs["claude_args"], ["--tools", "Read,Edit", "--agent", "x"])
+        self.assertEqual(call.kwargs["overrides"], {"tools": "off"})
+        call = self.run_main("official", "m", "--", "--auto-model", "nvidia/x", "--subagent", "off")
+        self.assertEqual(call.kwargs["claude_args"], ["--auto-model", "nvidia/x", "--subagent", "off"], "after --, all Claude's")
+        self.assertNotIn("overrides", call.kwargs)
+        with patch.object(self.ccx, "saved_bundle", return_value=None):
+            call = self.run_main("plain", "--subagent", "off", "--resume")
+        self.assertEqual(call.kwargs["claude_args"], ["--subagent", "off", "--resume"], "`claude` passes every word on")
+        self.assertNotIn("overrides", call.kwargs)
+
+    def test_flag_effort_splits_only_on_a_known_effort(self):
+        ccx = self.ccx
+        ccx.model_efforts = lambda provider, model: None
+        target = lambda value: ccx.launch_target("--subagent", value, list(ccx.PROVIDERS))
+        self.assertEqual(target("lmstudio/qwen3-8b@q4_k_m"), {"provider": "lmstudio", "model": "qwen3-8b@q4_k_m"})
+        self.assertEqual(target("nvidia/vendor/model@2025@high"),
+                         {"provider": "nvidia", "model": "vendor/model@2025", "effort": "high"})
+        self.assertEqual(ccx.launch_target("--auto-model", "openai-oauth/gpt-6-luna@minimal", list(ccx.PROVIDERS),
+                                           ccx.HELPER_EFFORTS)["effort"], "minimal")
+
+    def test_resumed_session_keeps_its_subagents_under_launch_flags(self):
+        ccx = self.ccx
+        old = {"agents": {"sub": {"provider": "nvidia", "model": "deepseek-ai/x"},
+                          "easy": {"provider": "official", "model": "claude-haiku-5-5", "upto": 60},
+                          "hard": {"provider": "official", "model": "claude-opus-5-5"}},
+               "off": True, "router": False, "sessions": ["sid-1"], "at": 1e12}
+        Path(ccx.SESSION_AGENTS_FILE).write_text(json.dumps({"old-launch": old}), encoding="utf-8")
+        ccx.apply_overrides("new-launch", {"levels": {"easy": {"provider": "official", "model": "claude-sonnet-5-5"}}},
+                            adapter=True, providers=list(ccx.PROVIDERS), resume=True)
+        with patch.dict(os.environ, {"CCX_LAUNCH_ID": "new-launch"}):
+            ccx.link_session("sid-1")
+            agents = ccx.load_agents()
+            self.assertEqual(agents["sub"], old["agents"]["sub"], "the resumed session's own subagent stays")
+            self.assertEqual(agents["easy"]["model"], "claude-sonnet-5-5", "and the flag wins over it")
+            self.assertEqual(agents["hard"]["model"], "claude-opus-5-5")
+            self.assertTrue(ccx.router_on(), "a --level flag turns the router on")
+            self.assertTrue(ccx.subagents_off(), "flags that do not name off keep the session's off switch")
+            self.assertNotIn("pending", json.loads(Path(ccx.SESSION_AGENTS_FILE).read_text())["new-launch"])
+        # a resumed session that never had its own subagents takes the flags over the global profiles
+        ccx.apply_overrides("other-launch", {"subagent": {"provider": "nvidia", "model": "m2"}},
+                            adapter=True, providers=list(ccx.PROVIDERS), resume=True)
+        with patch.dict(os.environ, {"CCX_LAUNCH_ID": "other-launch"}):
+            ccx.link_session("sid-unknown")
+            self.assertEqual(ccx.load_agents()["sub"]["model"], "m2")
+            self.assertFalse(ccx.router_on())
+        self.assertEqual(json.loads(Path(ccx.AGENTS_FILE).read_text()), self.global_agents)
+
+    def test_launch_flags_refuse_a_router_without_two_levels(self):
+        ccx = self.ccx
+        for overrides in ({"subagent": "router"}, {"levels": {"easy": {"provider": "official", "model": "m"}}},
+                          {"subagent": "router", "auto": {"provider": "nvidia", "model": "m"}}):
+            with self.subTest(overrides=overrides), self.assertRaises(SystemExit), \
+                    patch("sys.stderr", new_callable=io.StringIO):
+                ccx.apply_overrides("launch-a", overrides, adapter=True, providers=list(ccx.PROVIDERS))
+        self.assertFalse(Path(ccx.SESSION_AGENTS_FILE).exists(), "a refused launch writes nothing")
+        self.assertFalse(Path(ccx.ROUTES_FILE).exists())
+
+    def test_router_preset_can_be_built_from_nothing_and_grow_after_custom_ranges(self):
+        ccx = self.ccx
+        ccx.model_efforts = lambda provider, model: None
+        ccx.load_state = lambda: {}
+        run = lambda *words: ccx.presets_command(["set", *words])
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "", "CLAUDECODE": "", "CCX_MAIN_PROVIDER": ""}), \
+                patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO):
+            run("mine", "main", "official", "claude-opus-5-5")
+            run("mine", "subagent", "nvidia", "deepseek-ai/x")
+            run("mine", "subagent", "router")  # no level profiles anywhere: starts from the one subagent model
+            sub = ccx.saved_bundle("mine")["subagent"]
+            self.assertEqual(sub["provider"], "router")
+            self.assertEqual({(t["provider"], t["model"]) for t in sub["levels"].values()}, {("nvidia", "deepseek-ai/x")})
+            self.assertGreaterEqual(len(sub["levels"]), 2)
+            run("other", "main", "official", "claude-opus-5-5")
+            run("other", "level", "easy", "official", "claude-haiku-5-5")  # a level alone starts a router too
+            levels = ccx.saved_bundle("other")["subagent"]["levels"]
+            self.assertEqual(levels["easy"]["model"], "claude-haiku-5-5")
+            self.assertGreaterEqual(len(levels), 2)
+            # custom ranges, then new levels slot in between the saved tops
+            run("mine", "level", "easy", "official", "claude-haiku-5-5")
+            run("mine", "level", "hard", "official", "claude-opus-5-5")
+            for level in [n for n in ccx.saved_bundle("mine")["subagent"]["levels"] if n not in ("easy", "hard")]:
+                run("mine", "level", level, "off")
+            run("mine", "ranges", "95")
+            run("mine", "level", "mid", "official", "claude-sonnet-5-5")
+            run("mine", "level", "very-easy", "official", "claude-haiku-5-5")
+            run("mine", "level", "very-hard", "official", "claude-opus-5-5")
+            levels = ccx.saved_bundle("mine")["subagent"]["levels"]
+            self.assertEqual(list(levels), list(ccx.ROUTER_LEVELS))
+            tops = [levels[n].get("upto") for n in ccx.ROUTER_LEVELS]
+            self.assertIsNone(tops[-1])
+            self.assertTrue(all(a < b for a, b in zip([-1, *tops[:-1]], [*tops[:-1], 100])), tops)
+            self.assertEqual(levels["easy"]["upto"], 95, "the saved top stays")
+
+    def test_preset_fallback_keeps_effort_and_needs_another_provider(self):
+        ccx = self.ccx
+        ccx.model_efforts = lambda provider, model: None
+        ccx.load_state = lambda: {}
+        run = lambda *words: ccx.presets_command(["set", *words])
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "", "CLAUDECODE": "", "CCX_MAIN_PROVIDER": ""}), \
+                patch("sys.stdout", new_callable=io.StringIO), patch("sys.stderr", new_callable=io.StringIO):
+            run("nvidia", "main", "nvidia", "deepseek-ai/x")
+            with self.assertRaises(SystemExit):
+                run("nvidia", "fallback", "nvidia", "deepseek-ai/y")
+            run("nvidia", "fallback", "openai-oauth", "gpt-6-luna", "high")
+            self.assertEqual(ccx.preset_fallback("nvidia"), {"provider": "openai-oauth", "model": "gpt-6-luna", "effort": "high"})
+            run("nvidia", "auto", "openai-oauth", "gpt-6-luna", "minimal")  # the same efforts as `ccx helper`
+            self.assertEqual(ccx.saved_bundle("nvidia")["auto"]["effort"], "minimal")
+
+    def test_resume_flags_see_the_global_levels_the_session_shows(self):
+        ccx = self.ccx
+        Path(ccx.AGENTS_FILE).write_text(json.dumps({
+            "sub": {"provider": "official"}, "easy": {"provider": "official", "model": "claude-haiku-5-5", "upto": 60},
+            "hard": {"provider": "official", "model": "claude-opus-5-5"}}), encoding="utf-8")
+        old = {"agents": {"sub": {"provider": "nvidia", "model": "deepseek-ai/x"}}, "router": False, "sessions": ["sid-2"], "at": 1e12}
+        Path(ccx.SESSION_AGENTS_FILE).write_text(json.dumps({"old": old}), encoding="utf-8")
+        ccx.apply_overrides("new2", {"subagent": "router"}, adapter=True, providers=list(ccx.PROVIDERS), resume=True)
+        with patch.dict(os.environ, {"CCX_LAUNCH_ID": "new2"}):
+            ccx.link_session("sid-2")
+            self.assertTrue(ccx.router_on())
+            self.assertEqual(ccx.load_agents()["sub"]["model"], "deepseek-ai/x")
+
+    def test_flag_on_one_level_leaves_the_other_ranges_alone(self):
+        ccx = self.ccx
+        Path(ccx.AGENTS_FILE).write_text(json.dumps({
+            "easy": {"provider": "official", "model": "a"}, "mid": {"provider": "official", "model": "b", "upto": 50},
+            "hard": {"provider": "official", "model": "c"}}), encoding="utf-8")
+        before = ccx.level_ranges(ccx.load_agents(session=False))
+        ccx.apply_overrides("l9", {"levels": {"hard": {"provider": "official", "model": "d", "effort": "high"}}},
+                            adapter=True, providers=list(ccx.PROVIDERS))
+        with patch.dict(os.environ, {"CCX_LAUNCH_ID": "l9"}):
+            self.assertEqual(ccx.level_ranges({n: a for n, a in ccx.load_agents().items() if n in ccx.ROUTER_LEVELS}), before)
+
+    def test_flag_effort_for_another_flag_is_refused_not_kept_in_the_model(self):
+        ccx = self.ccx
+        ccx.model_efforts = lambda provider, model: None
+        with self.assertRaises(SystemExit), patch("sys.stderr", new_callable=io.StringIO):
+            ccx.launch_target("--subagent", "nvidia/x@minimal", list(ccx.PROVIDERS))
+
+    def test_old_same_provider_fallback_does_not_block_other_edits(self):
+        ccx = self.ccx
+        ccx.model_efforts = lambda provider, model: None
+        ccx.load_state = lambda: {}
+        same = {"provider": "gemini", "model": "g"}
+        Path(ccx.CFG_DIR, "presets.json").write_text(json.dumps({"gemini": {"model": "g", "settings": {
+            "model": same, "subagent": same, "fallback": {"provider": "gemini", "model": "g2"},
+            "auto": {"provider": "off"}, "tools": {"provider": "off"}}}}), encoding="utf-8")
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "", "CLAUDECODE": "", "CCX_MAIN_PROVIDER": ""}), \
+                patch("sys.stdout", new_callable=io.StringIO) as out, patch("sys.stderr", new_callable=io.StringIO):
+            ccx.presets_command(["set", "gemini", "tools", "off"])
+            self.assertEqual(ccx.saved_bundle("gemini")["fallback"], {"provider": "off"})
+            self.assertIn("fallback", out.getvalue().lower())
+            Path(ccx.CFG_DIR, "presets.json").write_text(json.dumps({"gemini": {"model": "g", "settings": {
+                "model": same, "subagent": same, "fallback": {"provider": "gemini", "model": "g2"},
+                "auto": {"provider": "off"}, "tools": {"provider": "off"}}}}), encoding="utf-8")
+            ccx.presets_command(["set", "gemini", "g3"])
+            self.assertEqual(ccx.saved_bundle("gemini")["fallback"], {"provider": "off"})
+
     def test_relay_pending_blocks_stop_once(self):
         job = "12345678-1234-1234-1234-123456789abc"
         Path(self.ccx.JOBS_DIR, job + ".out").write_text("", encoding="utf-8")

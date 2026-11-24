@@ -40,4 +40,6 @@ only-include = ["ccx_install.py"]
 "test_ccx_gui.py" = "ccx_files/test_ccx_gui.py"
 "commands" = "ccx_files/commands"
 "subagent-picker" = "ccx_files/subagent-picker"
+"harness" = "ccx_files/harness"
+"test_ccx_harness.py" = "ccx_files/test_ccx_harness.py"
 "ai_suite" = "ccx_files/ai_suite"

@@ -113,6 +113,58 @@ Presets store one Enter-away bundle per provider (main model, subagent, fallback
 helpers): `ccx presets`, `ccx presets set <provider> <model> [effort]`. `ccx gui [tab]` opens the window
 directly.
 
+### Setting each part separately
+
+Each part has its own model, set one at a time in a preset (kept for later launches) or with a launch flag
+(this launch only, over the preset). A launch on a provider starts from that provider's preset (here
+`official`); a named preset (any other name) is applied in a session from /model's Presets tab:
+
+```sh
+ccx presets set official main official claude-opus-5-5 high  # main model (a new named preset starts here)
+ccx presets set official subagent nvidia deepseek-ai/deepseek-v4-pro low   # one subagent model
+ccx presets set official subagent router                     # the difficulty router instead
+ccx presets set official level easy official claude-haiku-5-5 max  # one router level (`off` removes it)
+ccx presets set official ranges 30 75 89 95                  # router ranges: one top per level but the last
+ccx presets set official auto openai-oauth gpt-6-luna low    # Auto mode's classifier model (`off` = ccx default)
+ccx presets set official tools openai-oauth gpt-6-luna low   # Tools helper model (`off` = ccx default)
+ccx presets set official fallback nvidia deepseek-ai/x       # fallback route on another provider (`off` = none)
+ccx presets help                                             # the list above
+
+ccx openai-oauth gpt-6.1-sol --subagent router --level easy=official/claude-haiku-5-5@max \
+    --auto-model openai-oauth/gpt-6-luna@low --tools-model off --fallback nvidia/deepseek-ai/x
+```
+
+Flags take `<provider>/<model>[@effort]` (a trailing `@word` is an effort only when it names one, so ids like
+`qwen3-8b@q4_k_m` pass whole); `--subagent` also takes `router` or `off`, and `--level` repeats. A router needs
+two or more levels. Auto and Tools helpers need an adapter session; `--fallback` an adapter route or `official`.
+On a resume, subagent flags go over that session's own picks. Words after `--`, and every word of plain
+`claude`, go to Claude Code untouched (its own `--tools` and `--agent` included).
+
+### Other harnesses: pi, Hermes, opencode, Command Code
+
+`ccx --harness <pi|hermes|opencode|commandcode> <provider> <model> [--effort E] [part flags] [-- harness arguments]`
+starts another agent CLI with the same parts: the provider's preset, then the flags above. Every model call goes
+through the adapter at `/ccx/<launch>/v1/messages`, where placeholder models name the part (`ccx-main`,
+`ccx-live-<subagent or level>`, `ccx-auto`, `ccx-tools`) and the adapter swaps in this launch's picks, its keys and
+its fallback. The claude.ai login (`official`) serves Claude Code only, so it is refused there.
+
+| Harness | Main | Subagents / router | Auto | Tools | Your own config |
+|---|---|---|---|---|---|
+| pi | `--model ccx/ccx-main --thinking` | `subagent` tool from ccx's extension (`harness/pi/ccx.ts`) | the extension's gate on tool calls | compaction | untouched (`-e` per launch) |
+| Hermes | `--provider ccx -m ccx-main` | `delegation` (one model) or the `ccx-router` plugin | `auxiliary.approval` | compaction, titles, MCP, memory | untouched: a `ccx<id>` Hermes profile per set of picks (your Hermes gateway serves profiles; a separate home cannot start beside it), reusing your skills; delete one with `hermes profile delete <name>` |
+| opencode | `agents.build.model` with the effort variant | one `ccx-<name>` subagent per profile or level | ccx's plugin judges what your rules allow or ask; your denies stay final | title, summary, compaction | merged over yours (`OPENCODE_CONFIG_CONTENT`, `--standalone`) |
+| Command Code | BYOK provider `ccx`, `--effort` | `ccx-<name>` agents | `--yolo` plus a PreToolUse hook asking the classifier on every tool | title, compaction, tool descriptions, branch summaries | untouched: a ccx-owned home per set of picks under `%LOCALAPPDATA%\ccx\homes` (`HOME`/`USERPROFILE`) that links back every folder and file of yours, your Command Code login, skills, mods and settings included; `--local-only` |
+
+Launches with the same picks share one id (and one profile or home); other picks never rewrite a running
+session's. Those homes link to your own folders: never delete one with a tool that follows links. ccx does not
+clean them up: delete an old Hermes profile with `hermes profile delete ccx<id>`, and an old Command Code home by
+removing its links first. A launch's routes expire after 30 days; start the harness through ccx again to resume
+on it.
+
+A part you leave unset keeps the harness's own behaviour (pi has no approvals; Hermes, opencode and Command Code
+their usual ones). In pi and opencode a `/model` pick inside the session is saved to your own settings as usual.
+Codex and the Antigravity CLI need OpenAI-format endpoints on the adapter first.
+
 ## Status line
 
 ![Status line](docs/statusline.png)

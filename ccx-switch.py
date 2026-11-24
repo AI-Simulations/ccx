@@ -85,6 +85,7 @@ CCX_VARS = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
 PICKER_SLOTS = ["ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_CUSTOM_MODEL_OPTION"]
 # Claude Code's own /effort levels (claude --help).
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+HELPER_EFFORTS = ("low", "medium", "high", "xhigh", "max", "off", "none", "minimal")  # Auto/Tools helpers
 # Auto-compact thresholds offered by the menus; --autocompact takes any 1-100.
 AUTOCOMPACTS = [50, 60, 70, 80, 90, 95]
 COMPACT_TOKENS = ["100k", "200k", "300k", "400k", "600k"]
@@ -754,6 +755,195 @@ def seed_launch_from_preset(name, launch, adapter, providers):
         write_json(ROUTES_FILE, data, indent=1)
 
 
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*")
+
+
+def check_target(key, target, allowed, efforts=EFFORTS):
+    """One preset part's {provider, model[, effort]}, checked; dies on a bad one."""
+    if not isinstance(target, dict):
+        die(f"Invalid {key} preset.")
+    provider, model, effort = target.get("provider"), target.get("model"), target.get("effort", "default")
+    if not isinstance(provider, str) or provider not in allowed:
+        die(f"Invalid {key} provider.")
+    if not isinstance(model, str) or not MODEL_ID.fullmatch(model):
+        die(f"Invalid {key} model id.")
+    if effort != "default" and effort not in efforts:
+        die(f"Invalid {key} effort.")
+    if effort != "default":
+        levels = model_efforts(provider, model)
+        if levels is not None and effort not in levels:
+            die(f"{provider}/{model} does not support effort {effort}.")
+    return {"provider": provider, "model": model, **({"effort": effort} if effort != "default" else {})}
+
+
+def save_bundle(name, settings, helper_providers=None):
+    """Checks a complete five-category preset and saves it under `name`; returns what was saved.
+    Auto/Tools helpers must be on `helper_providers` (default: the routes this session can reach)."""
+    if name not in PROVIDERS and not PRESET_NAME.fullmatch(name):
+        die("A preset name is 1-32 letters, digits, '-' or '_'.")
+    if not isinstance(settings, dict) or set(settings) != set(PRESET_CATEGORIES):
+        die("A preset must include model, subagent, fallback, auto and tools.")
+    cleaned = {}
+    for key, target in settings.items():
+        if not isinstance(target, dict):
+            die(f"Invalid {key} preset.")
+        provider = target.get("provider")
+        if provider == "off" and key in ("fallback", "auto", "tools"):
+            cleaned[key] = {"provider": "off"}
+            continue
+        if provider == "router" and key == "subagent":
+            levels = target.get("levels")
+            order = [n for n in ROUTER_LEVELS if n in (levels or {})] if isinstance(levels, dict) else []
+            if len(order) < 2 or len(order) != len(levels):
+                die(f"A router preset sets two or more of these levels: {', '.join(ROUTER_LEVELS)}.")
+            picks = {level: check_target(level, levels[level], PROVIDERS) for level in order}
+            for level in order:  # each level may keep its own compact window
+                compact = levels[level].get("autocompact")
+                if compact not in (None, "", "inherit"):
+                    check_agents({level: {"autocompact": compact}})
+                    picks[level]["autocompact"] = compact
+            tops = [levels[level].get("upto") for level in order[:-1]]
+            if not (all(type(t) is int for t in tops) and all(a < b for a, b in zip([-1, *tops], [*tops, 100]))):
+                die(f"Router ranges: give {', '.join(order[:-1])} rising tops between 0 and 99; "
+                    f"{order[-1]} always reaches 100.")
+            for level, top in zip(order, tops):
+                picks[level]["upto"] = top
+            cleaned[key] = {"provider": "router", "levels": picks}
+            continue
+        if key in ("auto", "tools"):
+            helpers = route_providers() if helper_providers is None else helper_providers
+            cleaned[key] = check_target(key, target, helpers, HELPER_EFFORTS)
+        else:
+            cleaned[key] = check_target(key, target, FALLBACK_ROUTES if key == "fallback" else PROVIDERS)
+    if name in PROVIDERS and cleaned["model"]["provider"] != name:
+        die("The main model must use the preset's provider.")
+    if cleaned["fallback"].get("provider") == cleaned["model"]["provider"]:
+        die("The fallback must use another provider than the main model: it serves what that provider refuses.")
+    saved = load_presets()
+    saved[name] = {"model": cleaned["model"]["model"],
+                   **({"effort": cleaned["model"]["effort"]} if cleaned["model"].get("effort") else {}),
+                   "settings": cleaned}
+    save_presets(saved)
+    return cleaned
+
+
+# `ccx presets set <preset> <part> ...`: one part of a preset at a time.
+PRESET_PARTS = ("main", "subagent", "level", "ranges", "fallback", "auto", "tools")
+
+
+def preset_part_usage():
+    return ("Usage: ccx presets set <provider|name> main <provider> <model> [effort]\n"
+            "       ccx presets set <provider|name> subagent <provider> <model> [effort] | subagent router\n"
+            f"       ccx presets set <provider|name> level <{'|'.join(ROUTER_LEVELS)}> <provider> <model> [effort] | off\n"
+            "       ccx presets set <provider|name> ranges <top> ... (one per router level but the last)\n"
+            "       ccx presets set <provider|name> fallback|auto|tools <provider> <model> [effort] | off")
+
+
+def starter_router(bundle):
+    """A router to edit when the preset has none: the level profiles as set now, else the preset's
+    one subagent model (or its main model) on two levels."""
+    found = default_router_target()
+    if found:
+        return found
+    one = bundle["subagent"] if bundle["subagent"].get("provider") in PROVIDERS else bundle["model"]
+    pick = {k: one[k] for k in ("provider", "model", "effort") if one.get(k)}
+    return {"provider": "router", "levels": {"easy": {**pick, "upto": LEVEL_TOPS["easy"]}, "hard": dict(pick)}}
+
+
+def fill_tops(levels, only=None):
+    """Router `levels` (in order) where each level but the last has a top: a level without one (of
+    `only`, when given) gets its usual top when that fits between its neighbours' saved tops, else the
+    middle of the gap."""
+    order = list(levels)
+    tops = [levels[n].get("upto") for n in order[:-1]]
+    for i, level in enumerate(order[:-1]):
+        if tops[i] is not None or (only is not None and level not in only):
+            continue
+        low = max([t for t in tops[:i] if t is not None], default=-1)
+        high = min([t for t in tops[i + 1:] if t is not None], default=100)
+        top = LEVEL_TOPS[level] if low < LEVEL_TOPS[level] < high else (low + high) // 2
+        if not low < top < high:
+            die(f"No room for {level} between tops {low} and {high}; widen the gap with `ranges` first.")
+        tops[i] = levels[level]["upto"] = top
+    if order:
+        levels[order[-1]].pop("upto", None)
+    return levels
+
+
+def set_preset_part(name, part, rest):
+    """One part of a preset; the others stay as saved, or as the picker shows them for an unsaved provider."""
+    if name not in PROVIDERS and not PRESET_NAME.fullmatch(name):
+        die("A preset name is 1-32 letters, digits, '-' or '_'.")
+
+    def target(words):
+        if len(words) not in (2, 3):
+            die(preset_part_usage())
+        effort = words[2].lower() if len(words) == 3 else "default"
+        return {"provider": words[0].lower(), "model": words[1], **({"effort": effort} if effort != "default" else {})}
+
+    bundle = saved_bundle(name)
+    if bundle is None:
+        row = next((r for r in preset_targets() if r.get("name", r["provider"]) == name), None)
+        bundle = preset_bundle(row) if row else None
+    bundle = json.loads(json.dumps(bundle))  # edited below; never the cached original
+    if part == "main":
+        main = target(rest)
+        bundle = {**(bundle or preset_bundle({**main, "name": name})), "model": main}
+    elif bundle is None:
+        die(f"No preset '{name}' yet: set its main model first with `ccx presets set {name} main <provider> <model> [effort]`.")
+    elif part in ("fallback", "auto", "tools"):
+        bundle[part] = {"provider": "off"} if [w.lower() for w in rest] == ["off"] else target(rest)
+    elif part == "subagent":
+        if [w.lower() for w in rest] == ["router"]:
+            if not is_router_target(bundle["subagent"]):
+                bundle["subagent"] = starter_router(bundle)
+        else:
+            bundle["subagent"] = target(rest)
+    elif part == "level":
+        if not rest or rest[0].lower() not in ROUTER_LEVELS:
+            die(f"Router levels: {', '.join(ROUTER_LEVELS)}.\n{preset_part_usage()}")
+        level = rest[0].lower()
+        sub = bundle["subagent"] if is_router_target(bundle["subagent"]) else starter_router(bundle)
+        levels = {n: dict(v) for n, v in sub["levels"].items()}
+        if [w.lower() for w in rest[1:]] == ["off"]:
+            levels.pop(level, None)
+        else:
+            old = levels.get(level) or {}
+            levels[level] = {**{k: old[k] for k in ("autocompact", "upto") if k in old}, **target(rest[1:])}
+        levels = fill_tops({n: levels[n] for n in ROUTER_LEVELS if n in levels})
+        bundle["subagent"] = {"provider": "router", "levels": levels}
+    elif part == "ranges":
+        sub = bundle["subagent"]
+        if not is_router_target(sub):
+            die(f"Preset '{name}' runs subagents on one model; switch it with `ccx presets set {name} subagent router`.")
+        order = [n for n in ROUTER_LEVELS if n in sub["levels"]]
+        try:
+            tops = [int(w) for w in rest]
+        except ValueError:
+            die(f"Usage: ccx presets set {name} ranges {' '.join(f'<top of {n}>' for n in order[:-1])} (whole numbers, 0-99)")
+        if len(tops) != len(order) - 1:
+            die(f"Give {len(order) - 1} rising tops, one per level but the last ({', '.join(order[:-1])}).")
+        for level, top in zip(order, tops):
+            sub["levels"][level]["upto"] = top
+    else:
+        die(preset_part_usage())
+    if part != "fallback" and bundle["fallback"].get("provider") == bundle["model"].get("provider"):
+        bundle["fallback"] = {"provider": "off"}
+        print(f"Preset {name}: its fallback used the main provider and never ran; it is off now.")
+    # A preset serves later launches, not this session: any provider's helper (a launch on a route that
+    # cannot reach it keeps the main model there, see seed_launch_from_preset).
+    cleaned = save_bundle(name, bundle, helper_providers=list(PROVIDERS))
+    shown = cleaned["model" if part == "main" else "subagent" if part in ("level", "ranges") else part]
+    if shown.get("provider") == "router":
+        text = "router " + ", ".join(f"{n} {a}-{b} {shown['levels'][n]['provider']}/{shown['levels'][n]['model']}"
+                                     for n, (a, b) in level_ranges(shown["levels"]).items())
+    elif shown.get("provider") == "off":
+        text = "off"
+    else:
+        text = f"{shown['provider']}/{shown['model']}" + (f" · {shown['effort']}" if shown.get("effort") else "")
+    print(f"Preset {name}, {'main' if part == 'main' else 'subagent' if part in ('level', 'ranges') else part}: {text}")
+
+
 def presets_command(words):
     """List main-model picks or edit a complete five-category preset bundle."""
     if words == ["bundles"]:
@@ -761,68 +951,17 @@ def presets_command(words):
         return
     if words[:1] == ["use-subagent"] and len(words) == 2:
         return use_preset_subagent(words[1].strip().lower())
+    if words == ["help"]:
+        return print(preset_part_usage())
+    if words[:1] == ["set"] and len(words) >= 3 and words[2].lower() in PRESET_PARTS:
+        return set_preset_part(words[1].strip().lower(), words[2].lower(), words[3:])
     if words[:1] == ["set-bundle"] and len(words) == 3:
         name = words[1].strip().lower()
-        if name not in PROVIDERS and not PRESET_NAME.fullmatch(name):
-            die("A preset name is 1-32 letters, digits, '-' or '_'.")
         try:
             settings = json.loads(words[2])
         except ValueError:
             die("Invalid preset JSON.")
-        if not isinstance(settings, dict) or set(settings) != set(PRESET_CATEGORIES):
-            die("A preset must include model, subagent, fallback, auto and tools.")
-        def check_target(key, target, allowed):
-            if not isinstance(target, dict):
-                die(f"Invalid {key} preset.")
-            provider, model, effort = target.get("provider"), target.get("model"), target.get("effort", "default")
-            if not isinstance(provider, str) or provider not in allowed:
-                die(f"Invalid {key} provider.")
-            if not isinstance(model, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*", model):
-                die(f"Invalid {key} model id.")
-            if effort != "default" and effort not in EFFORTS:
-                die(f"Invalid {key} effort.")
-            if effort != "default":
-                levels = model_efforts(provider, model)
-                if levels is not None and effort not in levels:
-                    die(f"{provider}/{model} does not support effort {effort}.")
-            return {"provider": provider, "model": model, **({"effort": effort} if effort != "default" else {})}
-
-        cleaned = {}
-        for key, target in settings.items():
-            if not isinstance(target, dict):
-                die(f"Invalid {key} preset.")
-            provider = target.get("provider")
-            if provider == "off" and key in ("fallback", "auto", "tools"):
-                cleaned[key] = {"provider": "off"}
-                continue
-            if provider == "router" and key == "subagent":
-                levels = target.get("levels")
-                order = [n for n in ROUTER_LEVELS if n in (levels or {})] if isinstance(levels, dict) else []
-                if len(order) < 2 or len(order) != len(levels):
-                    die(f"A router preset sets two or more of these levels: {', '.join(ROUTER_LEVELS)}.")
-                picks = {level: check_target(level, levels[level], PROVIDERS) for level in order}
-                for level in order:  # each level may keep its own compact window
-                    compact = levels[level].get("autocompact")
-                    if compact not in (None, "", "inherit"):
-                        check_agents({level: {"autocompact": compact}})
-                        picks[level]["autocompact"] = compact
-                tops = [levels[level].get("upto") for level in order[:-1]]
-                if not (all(type(t) is int for t in tops) and all(a < b for a, b in zip([-1, *tops], [*tops, 100]))):
-                    die(f"Router ranges: give {', '.join(order[:-1])} rising tops between 0 and 99; "
-                        f"{order[-1]} always reaches 100.")
-                for level, top in zip(order, tops):
-                    picks[level]["upto"] = top
-                cleaned[key] = {"provider": "router", "levels": picks}
-                continue
-            allowed = FALLBACK_ROUTES if key == "fallback" else route_providers() if key in ("auto", "tools") else PROVIDERS
-            cleaned[key] = check_target(key, target, allowed)
-        if name in PROVIDERS and cleaned["model"]["provider"] != name:
-            die("The main model must use the preset's provider.")
-        saved = load_presets()
-        saved[name] = {"model": cleaned["model"]["model"],
-                       **({"effort": cleaned["model"]["effort"]} if cleaned["model"].get("effort") else {}),
-                       "settings": cleaned}
-        save_presets(saved)
+        save_bundle(name, settings)
         print(f"Preset saved: {name} (all five categories)")
         return
     if not words or words == ["list"]:
@@ -843,6 +982,11 @@ def presets_command(words):
         saved = load_presets()
         previous = saved.get(name)
         settings = previous.get("settings") if isinstance(previous, dict) else None
+        if isinstance(settings, dict) and isinstance(settings.get("model"), dict):
+            # the bundle's main model is what a launch from this preset uses: keep it in step
+            settings = {**settings, "model": {"provider": name, "model": model, **({"effort": effort} if effort != "default" else {})}}
+            if (settings.get("fallback") or {}).get("provider") == name:  # never ran: the fallback needs another provider
+                settings["fallback"] = {"provider": "off"}
         saved[name] = {"model": model, **({"effort": effort} if effort != "default" else {}),
                        **({"settings": settings} if isinstance(settings, dict) else {})}
         save_presets(saved)
@@ -856,7 +1000,8 @@ def presets_command(words):
         save_presets(saved)
         print(f"Preset {'reset' if name in PROVIDERS else 'deleted'}: {name}")
         return
-    die("Usage: ccx presets [list | bundles | set <provider> <model> [effort] | set-bundle <provider|name> <json> | use-subagent <provider|name> | reset <provider|name>]")
+    die("Usage: ccx presets [list | bundles | set <provider> <model> [effort] | set <provider|name> <part> ... | "
+        "set-bundle <provider|name> <json> | use-subagent <provider|name> | reset <provider|name>]\n" + preset_part_usage())
 
 
 def models_command(words):
@@ -1440,7 +1585,7 @@ def ensure_anthropic_proxy():
 
 def _ensure_anthropic_proxy():
     url = f"http://127.0.0.1:{ADAPTER_PORT}/health"
-    expected = {"service": "ccx-anthropic-proxy", "version": 37}  # the adapter's IDENTITY: a bump restarts every session's adapter
+    expected = {"service": "ccx-anthropic-proxy", "version": 38}  # the adapter's IDENTITY: a bump restarts every session's adapter
     try:
         running = fetch(url, timeout=1)
     except (OSError, ValueError):
@@ -1725,7 +1870,7 @@ def helper_command(words):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*", model):
             die("Invalid helper model id.")
         effort = route_effort(rest[2:])
-        if effort and effort not in ("low", "medium", "high", "xhigh", "max", "off", "none", "minimal"):
+        if effort and effort not in HELPER_EFFORTS:
             die("Invalid helper effort.")
         levels = model_efforts(provider, model) if effort else None
         if levels is not None and effort and effort not in levels:
@@ -1803,7 +1948,7 @@ def preset_fallback(name):
     """The saved preset's fallback route for this provider, or None."""
     target = (saved_bundle(name) or {}).get("fallback") or {}
     if target.get("provider") in FALLBACK_ROUTES and target["provider"] != name and target.get("model"):
-        return {"provider": target["provider"], "model": target["model"]}
+        return {k: target[k] for k in ("provider", "model", "effort") if target.get(k)}
     return None
 
 
@@ -1887,6 +2032,138 @@ def take_option(args, flag):
     return None
 
 
+# Launch flags for the parts besides the main model, this launch only:
+# --subagent P/M|router|off, --level <level>=P/M (repeatable), --auto-model P/M|off, --tools-model P/M|off,
+# --fallback P/M|off. Never a name Claude Code uses itself (it has --tools and --agent).
+LAUNCH_FLAG_USAGE = ("Launch flags (this launch only): --subagent <provider>/<model>[@effort]|router|off  "
+                     "--level <level>=<provider>/<model>[@effort]  --auto-model|--tools-model <provider>/<model>[@effort]|off  "
+                     "--fallback <provider>/<model>[@effort]|off")
+
+
+def launch_target(flag, value, allowed, efforts=EFFORTS):
+    """{provider, model[, effort]} from a launch flag's `provider/model[@effort]`; dies on a bad one."""
+    provider, _, model = value.partition("/")
+    provider, effort = provider.lower(), None
+    head, at, tail = model.rpartition("@")
+    if at and tail.lower() in (*efforts, "default"):  # model ids may hold '@' too (qwen3-8b@q4_k_m)
+        model, effort = head, None if tail.lower() == "default" else tail.lower()
+    elif at and tail.lower() in (*EFFORTS, *HELPER_EFFORTS):
+        die(f"{flag}: effort '{tail}' is for other parts; use one of {', '.join(efforts)}.")
+    if provider not in allowed or not MODEL_ID.fullmatch(model or "-"):
+        die(f"{flag} takes <provider>/<model>[@effort] (got '{value}'); providers: {', '.join(allowed)}.\n{LAUNCH_FLAG_USAGE}")
+    levels = model_efforts(provider, model) if effort else None
+    if levels is not None and effort not in levels:
+        die(f"{flag}: {provider}/{model} does not support effort {effort}.")
+    return {"provider": provider, "model": model, **({"effort": effort} if effort else {})}
+
+
+def launch_overrides(args):
+    """Takes the launch flags out of Claude's args: (overrides for apply_overrides, fallback or "off" or None)."""
+    overrides = {}
+    for kind in ("auto", "tools"):
+        value = take_option(args, f"--{kind}-model")
+        if value is not None:
+            overrides[kind] = "off" if value.lower() in ("off", "inherit") else \
+                launch_target(f"--{kind}-model", value, list(PROVIDERS), HELPER_EFFORTS)
+    value = take_option(args, "--subagent")
+    if value is not None:
+        overrides["subagent"] = value.lower() if value.lower() in ("router", "off") else \
+            launch_target("--subagent", value, list(PROVIDERS))
+    levels = {}
+    while (value := take_option(args, "--level")) is not None:
+        level, eq, target = value.partition("=")
+        if level.lower() not in ROUTER_LEVELS or not eq:
+            die(f"--level takes <level>=<provider>/<model>[@effort]; levels: {', '.join(ROUTER_LEVELS)}.")
+        levels[level.lower()] = launch_target("--level", target, list(PROVIDERS))
+    if levels:
+        overrides["levels"] = levels
+    value = take_option(args, "--fallback")
+    fallback = None if value is None else "off" if value.lower() == "off" else \
+        launch_target("--fallback", value, FALLBACK_ROUTES)
+    return overrides, fallback
+
+
+def overridden_agents(agents, entry, sub, levels, check=True):
+    """(profiles, off, router) for a session with launch flags `sub`/`levels` over its `agents` and
+    its entry's off/router switches."""
+    off, router = entry.get("off"), entry.get("router")
+    if isinstance(sub, dict):
+        agents, router = preset_profiles(sub, agents), False
+    elif sub == "router":
+        router = True
+    if sub == "off":
+        off = True
+    elif sub is not None:
+        off = None
+    added = [level for level in levels or {} if not agents.get(level)]
+    for level, pick in (levels or {}).items():
+        old = agents.get(level) or {}
+        agents[level] = {**{k: v for k, v in old.items() if k not in ("provider", "model", "effort")}, **pick,
+                         "description": old.get("description") or LEVEL_TEXT[level]}
+    if levels and not isinstance(sub, dict):
+        router = True
+    if check and router is not False and (sub == "router" or levels):
+        ready = [n for n in ROUTER_LEVELS if (agents.get(n) or {}).get("provider") in PROVIDERS and agents[n].get("model")]
+        if len(ready) < 2:
+            die(f"The router needs two or more levels with a model (has: {', '.join(ready) or 'none'}); "
+                "add them with --level <level>=<provider>/<model>.")
+    if added:  # the levels share these dicts: new ones get tops between the saved ones, the rest stay
+        fill_tops({n: agents[n] for n in ROUTER_LEVELS if n in agents}, only=added)
+    return agents, off, router
+
+
+def apply_overrides(launch, overrides, adapter, providers, resume=False):
+    """This launch's helper and subagent picks from its launch flags, over what its preset seeded. A
+    resume keeps them pending until link_session knows which session's own picks they go over."""
+    global _STARTUP_LAUNCH
+    helpers = {k: overrides[k] for k in ("auto", "tools") if k in overrides}
+    sub, levels = overrides.get("subagent"), overrides.get("levels") or {}
+    if helpers:
+        if not adapter:
+            die("--auto-model/--tools-model pick the adapter's helper models, and this route connects directly; "
+                "launch it through the adapter (an adapter route, or ccx official).")
+        far = sorted({t["provider"] for t in helpers.values() if t != "off" and t["provider"] not in providers})
+        if far:
+            die(f"--auto-model/--tools-model: this launch cannot reach {', '.join(far)}; use one of {', '.join(providers)}.")
+    if sub is not None or levels:
+        # The edits below belong to this launch's session entry, never the global profiles; worked out
+        # before anything is written (a resume works them out again over its session's own picks).
+        os.environ["CCX_LAUNCH_ID"] = _STARTUP_LAUNCH = launch
+        agents, off, router = overridden_agents(load_agents(session=not resume), {}, sub, levels, check=not resume)
+    if helpers:
+        data = load_routes()
+        row = dict(data.get(launch) or {})
+        current = dict(row.get("helpers") or {})
+        for kind, target in helpers.items():
+            if target == "off":
+                current.pop(kind, None)
+            else:
+                current[kind] = target
+        row = {**{k: v for k, v in row.items() if k != "helpers"}, **({"helpers": current} if current else {}), "at": time.time()}
+        if set(row) == {"at"}:
+            data.pop(launch, None)
+        else:
+            data[launch] = row
+        write_json(ROUTES_FILE, data, indent=1)
+    if sub is None and not levels:
+        return
+    if resume:
+        try:
+            with open(SESSION_AGENTS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        data[launch] = {"pending": {"subagent": sub, "levels": levels}, "at": time.time()}
+        write_json(SESSION_AGENTS_FILE, data, indent=1)
+        return
+    if isinstance(sub, dict) or levels:
+        with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink):
+            save_agents(agents)
+    _set_session_flag("off", off, "on|off")
+    if not off:
+        _set_session_flag("router", router is not False, "router on|off")
+
+
 # ---------------- apply ----------------
 
 def ps_quote(value):
@@ -1897,14 +2174,16 @@ def sh_quote(value):
     return "'" + str(value).replace("'", "'\\''") + "'"
 
 
-def write_apply(env, delete, run_claude, claude_args=(), model=None):
+def write_apply(env, delete, run_claude, claude_args=(), model=None, program=None):
+    """The shell script the ccx function sources: env, then `claude` (or `program`, another harness)."""
     if os.name != "nt":
         # Sourced by the shell's ccx function. A launch runs in a subshell, so the provider
         # variables end with it and a later plain `claude` opens default Claude.
         lines = [f"unset {k}" for k in delete] + [f"export {k}={sh_quote(v)}" for k, v in env.items()]
         if run_claude:
-            command = " ".join(["claude", *map(sh_quote, (["--model", model] if model else []) + list(claude_args))])
-            lines = ["(", *lines, "printf 'Starting Claude Code...\\n'", command, ")"]
+            command = " ".join([program[0], *map(sh_quote, program[1:])] if program else
+                               ["claude", *map(sh_quote, (["--model", model] if model else []) + list(claude_args))])
+            lines = ["(", *lines, f"printf 'Starting {program[0] if program else 'Claude Code'}...\\n'", command, ")"]
         with open(APPLY_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         return
@@ -1914,9 +2193,10 @@ def write_apply(env, delete, run_claude, claude_args=(), model=None):
         # Scope the provider env vars to this launch, so a later plain `claude` opens default Claude.
         names = list(dict.fromkeys([*delete, *env]))
         saved = "; ".join(f"'{k}' = [Environment]::GetEnvironmentVariable('{k}')" for k in names)
-        command = " ".join(["claude", *map(ps_quote, (["--model", model] if model else []) + list(claude_args))])
+        command = " ".join([program[0], *map(ps_quote, program[1:])] if program else
+                           ["claude", *map(ps_quote, (["--model", model] if model else []) + list(claude_args))])
         lines = [f"$ccSaved = @{{{saved}}}", "try {", *lines,
-                 'Write-Host "Starting Claude Code..." -ForegroundColor Gray',
+                 f'Write-Host "Starting {program[0] if program else "Claude Code"}..." -ForegroundColor Gray',
                  "Remove-Item -LiteralPath $PSCommandPath -ErrorAction SilentlyContinue",
                  command,
                  "} finally { foreach ($k in $ccSaved.Keys) { [Environment]::SetEnvironmentVariable($k, $ccSaved[$k]) } }"]
@@ -2071,7 +2351,8 @@ def route_env(name, model_id, passthrough=False):
     return env
 
 
-def apply(name, model_id=None, no_run=False, claude_args=(), effort=None, autocompact=None, fallback=None, launch=None):
+def apply(name, model_id=None, no_run=False, claude_args=(), effort=None, autocompact=None, fallback=None, launch=None,
+          overrides=None):
     env = route_env(name, model_id, passthrough=True)
     # Every launch gets an id: subagent profiles and the optional route override are per session.
     env["CCX_LAUNCH_ID"] = launch = launch or os.environ.get("CCX_LAUNCH_ID") or uuid.uuid4().hex
@@ -2079,13 +2360,16 @@ def apply(name, model_id=None, no_run=False, claude_args=(), effort=None, autoco
         # Names this launch to the adapter, so /fallback and /model can change it mid-session.
         env["ANTHROPIC_CUSTOM_HEADERS"] = "\n".join(filter(None, [env.get("ANTHROPIC_CUSTOM_HEADERS"), f"x-ccx-launch: {launch}"]))
         if fallback:
-            set_fallback(launch, fallback["provider"], fallback["model"])
+            set_fallback(launch, fallback["provider"], fallback["model"], fallback.get("effort"))
     env["CCX_MAIN_PROVIDER"] = name
     env["CLAUDE_CODE_FORK_SUBAGENT"] = "0"
     base = env.get("ANTHROPIC_BASE_URL", "")
+    adapter = name in FALLBACK_ROUTES or base in OFFICIAL_BASES
+    providers = [n for n in PROVIDERS if n != "official" or base in OFFICIAL_BASES]
     if not is_resume(claude_args):  # a resume takes its old session's settings back (link_session)
-        seed_launch_from_preset(name, launch, adapter=name in FALLBACK_ROUTES or base in OFFICIAL_BASES,
-                                providers=[n for n in PROVIDERS if n != "official" or base in OFFICIAL_BASES])
+        seed_launch_from_preset(name, launch, adapter=adapter, providers=providers)
+    if overrides:  # launch flags win over the preset, and over a resumed session's own picks
+        apply_overrides(launch, overrides, adapter, providers, resume=is_resume(claude_args))
     if autocompact:
         claude_args = [*claude_args]
         compact_launch(env, claude_args, autocompact)
@@ -2112,6 +2396,386 @@ def apply(name, model_id=None, no_run=False, claude_args=(), effort=None, autoco
           f"effort={effort or 'Claude default'} (/effort changes it)  "
           f"autocompact={compact_text(autocompact, 'Claude default')}  "
           f"fallback={fallback['provider'] + '/' + fallback['model'] if fallback else 'off'} (/fallback changes it)")
+    if overrides:
+        text = lambda t: t if isinstance(t, str) else f"{t['provider']}/{t['model']}" + (f"@{t['effort']}" if t.get("effort") else "")
+        picks = [f"{k}={text(overrides[k])}" for k in ("subagent", "auto", "tools") if k in overrides]
+        picks += [f"{n}={text(t)}" for n, t in (overrides.get("levels") or {}).items()]
+        print("Launch picks: " + "  ".join(picks))
+
+
+# ---------------- other harnesses ----------------
+# `ccx --harness pi|hermes <provider> <model> [flags]`: another agent CLI, with every model part on the
+# adapter's /ccx/<launch> route. The harness asks for placeholder models (ccx-main, ccx-live-<profile>,
+# ccx-auto, ccx-tools); the adapter maps them to this launch's picks and does the fallback itself.
+
+HARNESSES = ("claude", "pi", "hermes", "opencode", "commandcode")
+HARNESS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "harness")
+HARNESS_KEY = "ccx-local"  # the harness's API key: the adapter holds the real ones
+# Hermes side calls that follow the Tools model (auxiliary.<task>); vision and approval stay apart.
+HERMES_TOOL_TASKS = ("compression", "title_generation", "mcp", "memory_query_rewrite")
+
+
+def harness_parts(launch):
+    """What a harness launch offers besides its main model: its subagents (router levels or one-model
+    profiles) and whether Auto mode and Tools have their own model."""
+    agents = _session_agents(launch) or load_agents(session=False)
+    usable = {}
+    for name, a in agents.items():
+        if a.get("provider", "official") == "official" or not a.get("model"):
+            print(f"Subagent '{name}' left out: other harnesses cannot use "
+                  f"{'the claude.ai login' if a.get('provider', 'official') == 'official' else 'a profile without a model'}.",
+                  file=sys.stderr)
+        else:
+            usable[name] = a
+    levels = [n for n in ROUTER_LEVELS if n in usable]
+    router = router_on(launch) and len(levels) >= 2
+    if subagents_off(launch):
+        subagents = []
+    elif router:
+        ranges = level_ranges({n: usable[n] for n in levels})
+        subagents = [{"name": n, "model": LIVE_MODEL + n, "description": usable[n].get("description") or LEVEL_TEXT[n],
+                      "range": list(ranges[n])} for n in levels]
+    else:
+        # one model each; a router left with a single usable level offers that level as one more subagent
+        subagents = [{"name": n, "model": LIVE_MODEL + n, "description": a.get("description") or LEVEL_TEXT.get(n)
+                      or "A general-purpose subagent."}
+                     for n, a in usable.items() if n not in ROUTER_LEVELS or router_on(launch)]
+    helpers = (load_routes().get(launch) or {}).get("helpers") or {}
+    return {"router": router and bool(subagents), "subagents": subagents, "auto": "auto" in helpers, "tools": "tools" in helpers}
+
+
+LIVE_MODEL = "ccx-live-"  # the adapter's name for a subagent profile's model (ccx-anthropic-proxy.py)
+
+
+def pi_launch(launch, parts, effort, args):
+    """pi with ccx's extension: the ccx provider, the subagent tool, the Auto gate and the Tools compaction."""
+    ext = os.path.join(HARNESS_DIR, "pi", "ccx.ts")
+    program = ["pi", "-e", ext, "--model", "ccx/ccx-main", *(["--thinking", effort] if effort else []), *args]
+    return program, {"CCX_LAUNCH_ID": launch, "CCX_ADAPTER": ADAPTER_URL, "CCX_PI_EXTENSION": ext,
+                     "CCX_HARNESS_PARTS": json.dumps(parts, separators=(",", ":"))}
+
+
+def hermes_user_home():
+    """The user's own Hermes home, as Hermes finds it: HERMES_HOME, else the platform default."""
+    if os.environ.get("HERMES_HOME", "").strip():
+        return Path(os.path.expanduser(os.environ["HERMES_HOME"]))
+    if os.name == "nt":
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "hermes"
+    return Path.home() / ".hermes"
+
+
+def hermes_root():
+    """The Hermes root that holds profiles/ (HERMES_HOME may name a profile inside it)."""
+    home = hermes_user_home()
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
+def hermes_create_profile(name):
+    """`hermes profile create`: registers a profile the user's Hermes gateway then serves."""
+    subprocess.run(["hermes", "profile", "create", name, "--no-alias", "--no-skills",
+                    "--description", "ccx launch profile for `ccx --harness hermes`: not for kanban or other tasks; safe to delete"], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def hermes_launch(launch, parts, effort, args):
+    """Hermes on a ccx profile named after the launch's picks: Hermes reads subagent, approval and
+    side-task models only from config, and one gateway serves every profile (a separate HERMES_HOME
+    cannot start beside the user's)."""
+    import shutil
+    home = hermes_root() / "profiles" / launch
+    if not home.is_dir():
+        hermes_create_profile(launch)
+    if not home.is_dir():
+        die(f"Could not create the Hermes profile {launch}; check `hermes profile create {launch}`.")
+    route = {"base_url": f"{ADAPTER_URL}/ccx/{launch}", "api_key": HARNESS_KEY, "api_mode": "anthropic_messages"}
+    config = {"model": {"default": "ccx-main", "provider": "ccx"},
+              "providers": {"ccx": {"name": "ccx", **route}},
+              "agent": {**({"reasoning_effort": effort} if effort else {})},
+              "skills": {"external_dirs": [str(hermes_root() / "skills")]}}
+    subagents = parts["subagents"]
+    if parts["router"]:
+        config["delegation"] = {"backend": "ccx-router", "backends": {"ccx-router": {**route, "levels": subagents}}}
+        config["plugins"] = {"enabled": ["ccx-router"]}
+        plugin = home / "plugins" / "ccx-router"
+        shutil.rmtree(plugin, ignore_errors=True)
+        shutil.copytree(os.path.join(HARNESS_DIR, "hermes", "ccx-router"), plugin,
+                        ignore=shutil.ignore_patterns("__pycache__"))
+    elif subagents:
+        one = next((a for a in subagents if a["name"] == "sub"), subagents[0])
+        config["delegation"] = {"provider": "custom", "model": one["model"], **route}
+    else:
+        config["agent"]["disabled_toolsets"] = ["delegation"]
+    aux = {}
+    if parts["auto"]:
+        aux["approval"] = {"provider": "custom", "model": "ccx-auto", **route}
+    if parts["tools"]:
+        aux.update({task: {"provider": "custom", "model": "ccx-tools", **route} for task in HERMES_TOOL_TASKS})
+    if aux:
+        config["auxiliary"] = aux
+    write_json(str(home / "config.yaml"), config, indent=2)  # JSON is YAML
+    program = ["hermes", "-p", launch, "chat", "--cli", "--provider", "ccx", "-m", "ccx-main",
+               *(["--reasoning", effort] if effort else []), *args]
+    return program, {"CCX_LAUNCH_ID": launch}
+
+
+# Homes ccx makes for harnesses that read their settings from the home folder (Command Code): outside
+# ~/.config, since such a home links back to the user's own folders, ~/.config included.
+HOMES_DIR = (os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local"), "ccx", "homes")
+             if os.name == "nt" else os.path.expanduser("~/.local/share/ccx/homes"))
+# Harnesses that read the launch's route from a config file they keep using: their launch id names the
+# exact picks, so a later launch with other picks never rewrites a running session's config.
+FILE_HARNESSES = ("hermes", "commandcode")
+
+
+def settle_launch(old, harness, parts, effort):
+    """Renames launch `old` to an id derived from its picks (main, subagents, helpers, fallback): the same
+    picks share one id, config and home; other picks get their own."""
+    import hashlib
+    files = {}
+    for path in (ROUTES_FILE, SESSION_AGENTS_FILE, FALLBACKS_FILE):
+        try:
+            with open(path, encoding="utf-8") as f:
+                files[path] = json.load(f)
+        except (OSError, ValueError):
+            files[path] = {}
+    state = {os.path.basename(path): {k: v for k, v in (data.get(old) or {}).items() if k not in ("at", "sessions")}
+             for path, data in files.items()}
+    shape = json.dumps({"harness": harness, "parts": parts, "effort": effort, "state": state}, sort_keys=True)
+    new = "ccx" + hashlib.sha1(shape.encode()).hexdigest()[:10]
+    for path, data in files.items():
+        if isinstance(data.get(old), dict):
+            data[new] = {**data.pop(old), "at": time.time()}
+            write_json(path, data, indent=1)
+    return new
+
+
+def opencode_launch(launch, parts, effort, args):
+    """opencode with an inline config (merged over the user's): the ccx provider, one subagent per
+    profile or router level, the Tools model on its side agents and the Auto plugin.
+    --standalone: the shared opencode service ignores a client's config."""
+    context = parts.get("context") or 200000
+
+    def model(name, reasoning=False):
+        caps = {"tools": True, "input": ["text", "image"], "output": ["text"],
+                **({"reasoning": {"supported": True, "effort": EFFORTS}} if reasoning else {})}
+        return {"name": name, "capabilities": caps, "limit": {"context": context, "output": 32000}}
+
+    subagents = parts["subagents"]
+    models = {"ccx-main": model("ccx main", True),
+              **{s["model"]: model(f"ccx {s['name']}", True) for s in subagents},
+              "ccx-auto": model("ccx Auto classifier"), "ccx-tools": model("ccx Tools helper")}
+    main = "ccx/ccx-main" + (f"#{effort}" if effort else "")
+    agents = {"build": {"model": main}, "plan": {"model": main},
+              **{f"ccx-{s['name']}": {"mode": "subagent", "model": "ccx/" + s["model"],
+                                      "description": s["description"] + (f" (difficulty {s['range'][0]}-{s['range'][1]})"
+                                                                         if s.get("range") else "")}
+                 for s in subagents},
+              "general": {"disabled": True}}  # its work goes to the ccx subagents (none when off)
+    if not subagents:
+        agents["explore"] = {"disabled": True}
+    if parts["tools"]:
+        agents.update({side: {"model": "ccx/ccx-tools"} for side in ("title", "summary", "compaction")})
+    config = {"$schema": "https://opencode.ai/config.json", "model": "ccx/ccx-main",
+              "providers": {"ccx": {"name": "ccx", "package": "@opencode/ai/providers/anthropic",
+                                    "settings": {"baseURL": f"{ADAPTER_URL}/ccx/{launch}/v1", "apiKey": HARNESS_KEY},
+                                    "models": models}},
+              "agents": agents}
+    if parts["auto"]:
+        # the plugin judges every action the user's rules allow or ask about; their denies stay final
+        config["plugins"] = [{"package": os.path.join(HARNESS_DIR, "opencode", "ccx-auto")}]
+    return ["opencode", "--standalone", *args], {"OPENCODE_CONFIG_CONTENT": json.dumps(config, separators=(",", ":")),
+                                                 "CCX_LAUNCH_ID": launch}
+
+
+# Command Code side calls that follow the Tools model (featureModels).
+CMDC_TOOL_FEATURES = ("titleGeneration", "compaction", "toolDescription", "branchSummarization")
+
+
+def mirror_home(real, mine, skip=()):
+    """Links every entry of folder `real` into `mine` (junctions/symlinks for folders, hard links for files),
+    except `skip` and what `mine` already has. Never delete such a home with a tool that follows links."""
+    try:
+        entries = list(real.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        target = mine / entry.name
+        if entry.name in skip or entry.name.lower().startswith("ntuser"):
+            continue
+        if os.path.lexists(target):
+            # A hard link splits when either side is rewritten (temp file + rename): link the user's file afresh.
+            try:
+                stale = entry.is_file() and target.is_file() and not os.path.samefile(entry, target)
+                if stale:
+                    target.unlink()
+            except OSError:
+                stale = False
+            if not stale:
+                continue
+        try:
+            if entry.is_dir():
+                if os.name == "nt":
+                    import _winapi
+                    _winapi.CreateJunction(str(entry), str(target))
+                else:
+                    os.symlink(entry, target, target_is_directory=True)
+            elif entry.is_file():
+                os.link(entry, target)
+        except OSError:
+            pass  # locked or on another drive: that entry stays missing
+
+
+def commandcode_launch(launch, parts, effort, args):
+    """Command Code reads custom providers only from ~/.commandcode, so it runs on a ccx-owned home
+    (HOME and USERPROFILE) that mirrors the user's: every folder and file linked back, the Command Code
+    login, skills and mods included, with ccx's provider, settings and agents in place. Nothing goes to
+    Command Code's servers (--local-only)."""
+    home = Path(HOMES_DIR) / "commandcode" / launch
+    real = Path.home()
+    cc = home / ".commandcode"
+    (cc / "agents").mkdir(parents=True, exist_ok=True)
+    mirror_home(real, home, skip={".commandcode"})
+    mirror_home(real / ".commandcode", cc, skip={"providers.json", "settings.json", "agents"})
+    context = parts.get("context") or 200000
+    models = {"ccx-main": {"name": "ccx main", "contextWindow": context, "maxOutput": 32000, "reasoningEfforts": EFFORTS},
+              **{s["model"]: {"name": f"ccx {s['name']}", "contextWindow": context, "maxOutput": 32000,
+                              "reasoningEfforts": EFFORTS} for s in parts["subagents"]},
+              "ccx-auto": {"contextWindow": context}, "ccx-tools": {"contextWindow": context}}
+    write_json(str(cc / "providers.json"), {"provider": {"ccx": {
+        "name": "ccx", "api": "anthropic-messages", "baseURL": f"{ADAPTER_URL}/ccx/{launch}",
+        "apiKey": False, "models": models}}}, indent=2)  # keyless: the adapter holds the keys
+    try:
+        with open(real / ".commandcode" / "settings.json", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        settings = {}
+    settings = settings if isinstance(settings, dict) else {}
+    settings["model"] = "ccx/ccx-main"
+    if parts["tools"]:
+        settings["featureModels"] = {**(settings.get("featureModels") or {}),
+                                     **{feature: "ccx/ccx-tools" for feature in CMDC_TOOL_FEATURES}}
+    if parts["auto"]:
+        # --yolo asks about nothing: the classifier sees every tool call instead
+        hook = f'"{sys.executable}" -B "{os.path.abspath(__file__)}" harness-auto {launch}'
+        hooks = dict(settings.get("hooks") or {})
+        hooks["PreToolUse"] = [*(hooks.get("PreToolUse") or []),
+                               {"matcher": ".*", "hooks": [{"type": "command", "command": hook, "timeout": 60,
+                                                             "failClosed": True}]}]  # a crash or timeout blocks
+        settings["hooks"] = hooks
+    write_json(str(cc / "settings.json"), settings, indent=2)
+    for old in (cc / "agents").glob("ccx-*.md"):
+        old.unlink()
+    for s in parts["subagents"]:
+        description = s["description"] + (f" (difficulty {s['range'][0]}-{s['range'][1]})" if s.get("range") else "")
+        (cc / "agents" / f"ccx-{s['name']}.md").write_text(
+            f"---\nname: ccx-{s['name']}\ndescription: {json.dumps(description)}\nmodel: ccx/{s['model']}\n"
+            'tools: "*"\n---\n\n'
+            "You are a subagent. Do the task you are given completely, then report what you did and found.\n",
+            encoding="utf-8")
+    real_agents = real / ".commandcode" / "agents"
+    if real_agents.is_dir():  # the user's own agents beside ccx's
+        mirror_home(real_agents, cc / "agents")
+    program = ["cmdc", "--model", "ccx/ccx-main", *(["--effort", effort] if effort else []), "--local-only",
+               *(["--yolo"] if parts["auto"] else []), *args]  # Auto: the classifier hook answers instead of you
+    return program, {"HOME": str(home), "USERPROFILE": str(home), "CCX_LAUNCH_ID": launch}
+
+
+AUTO_PROMPT = ("You approve or block one tool call by a coding agent working in {cwd}. Block anything destructive, "
+               "irreversible, outside the project, exfiltrating secrets or not plausibly part of ordinary development "
+               "work.\nTool: {tool}\nInput: {input}\nAnswer ALLOW or BLOCK on the first line, then one short reason.")
+READ_ONLY_TOOLS = ("read", "read_file", "read_multiple_files", "read_directory", "list_directory", "grep", "glob",
+                   "ls", "find")
+PATH_FIELDS = ("absolute_path", "file_path", "path", "directory", "dir_path", "paths")
+
+
+def reads_inside(cwd, tool_input):
+    """True when every path a read names lies inside `cwd` (no path: the project itself)."""
+    paths = []
+    for field in PATH_FIELDS:
+        value = (tool_input or {}).get(field) if isinstance(tool_input, dict) else None
+        paths += value if isinstance(value, list) else [value] if value else []
+    root = os.path.normcase(os.path.abspath(cwd))
+    for path in paths:
+        full = os.path.normcase(os.path.abspath(os.path.join(cwd, str(path))))
+        if full != root and not full.startswith(root.rstrip(os.sep) + os.sep):
+            return False
+    return True
+
+
+def harness_post(launch, body):
+    """One non-streaming request on a harness launch's adapter route; the reply's text."""
+    import urllib.request
+    request = urllib.request.Request(f"{ADAPTER_URL}/ccx/{launch}/v1/messages", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "x-api-key": HARNESS_KEY})
+    with urllib.request.urlopen(request, timeout=55) as response:
+        reply = json.load(response)
+    return "".join(block.get("text", "") for block in reply.get("content") or [] if block.get("type") == "text")
+
+
+def harness_auto(launch, payload, post=harness_post):
+    """`ccx-switch.py harness-auto <launch>`: a PreToolUse hook that asks the launch's Auto classifier.
+    Reads pass; a classifier that cannot answer blocks (Auto mode runs without asking you)."""
+    tool = str(payload.get("tool_name") or "")
+    if tool in READ_ONLY_TOOLS and reads_inside(payload.get("cwd") or os.getcwd(), payload.get("tool_input")):
+        verdict = "ALLOW"
+    else:
+        prompt = AUTO_PROMPT.format(cwd=payload.get("cwd") or os.getcwd(), tool=tool,
+                                    input=json.dumps(payload.get("tool_input"))[:8000])
+        try:
+            verdict = post(launch, {"model": "ccx-auto", "max_tokens": 256, "stream": False,
+                                    "messages": [{"role": "user", "content": prompt}]}).strip()
+        except Exception as exc:
+            verdict = f"BLOCK the Auto classifier could not answer ({type(exc).__name__})"
+    allowed = bool(re.match(r"ALLOW\b", verdict, re.I))
+    reason = "" if allowed else "Auto mode blocked this: " + (re.sub(r"^BLOCK\b[:\s-]*", "", verdict, flags=re.I) or "no reason given")
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow" if allowed else "deny",
+                                   "permissionDecisionReason": reason}}
+
+
+HARNESS_LAUNCHERS = {"pi": pi_launch, "hermes": hermes_launch, "opencode": opencode_launch,
+                     "commandcode": commandcode_launch}
+
+
+def launch_harness(harness, name, model_id, effort, overrides, fallback_flag, args):
+    """Sets this launch's parts for the adapter, then runs the harness on them."""
+    global _STARTUP_LAUNCH
+    if name == "official":
+        die(f"{harness} cannot use the claude.ai login (official); pick another provider.")
+    if fallback_flag not in (None, "off") and fallback_flag["provider"] == name:
+        die("--fallback needs another provider than the main one.")
+    ensure_key(name)
+    if name == "openai-oauth":
+        ensure_oauth_proxy()
+    elif name == "antigravity-cli":
+        try:
+            agy_executable()
+        except RuntimeError as exc:
+            die(str(exc))
+    ensure_anthropic_proxy()
+    effort = effort or default_effort(name, model_id)
+    launch = uuid.uuid4().hex
+    os.environ["CCX_LAUNCH_ID"] = _STARTUP_LAUNCH = launch  # the edits below belong to this launch only
+    providers = [n for n in PROVIDERS if n != "official"]
+    seed_launch_from_preset(name, launch, adapter=True, providers=providers)
+    if overrides:
+        apply_overrides(launch, overrides, True, providers)
+    set_route(launch, name, model_id, effort)
+    fallback = preset_fallback(name) if fallback_flag is None else None if fallback_flag == "off" else fallback_flag
+    if fallback:
+        set_fallback(launch, fallback["provider"], fallback["model"], fallback.get("effort"))
+    parts = harness_parts(launch)
+    context = next((m.get("context") for m in get_models(name) if m.get("id") == model_id), None)
+    if type(context) is int and context > 0:
+        parts["context"] = context
+    if harness in FILE_HARNESSES:
+        launch = settle_launch(launch, harness, parts, effort)
+        os.environ["CCX_LAUNCH_ID"] = _STARTUP_LAUNCH = launch
+    program, env = HARNESS_LAUNCHERS[harness](launch, parts, effort, args)
+    write_apply(env, [], True, program=program)
+    print(f"\n{harness}: main {name}/{model_id}" + (f" · {effort}" if effort else "")
+          + (f"; fallback {fallback['provider']}/{fallback['model']}" if fallback else "")
+          + f"; subagents {', '.join(s['name'] for s in parts['subagents']) or 'off'}"
+          + f"; Auto {'ccx' if parts['auto'] else harness + ' default'}; Tools {'ccx' if parts['tools'] else harness + ' default'}")
 
 
 # ---------------- subagents ----------------
@@ -2180,6 +2844,25 @@ def link_session(sid):
     def kept(e):
         return isinstance(e, dict) and (isinstance(e.get("agents"), dict) or e.get("off") or "router" in e)
     entry = data.get(launch)
+    if isinstance(entry, dict) and isinstance(entry.get("pending"), dict):
+        old = [e for k, e in data.items() if k != launch and kept(e) and sid in e.get("sessions", ())]
+        last = max(old, key=lambda e: e.get("at", 0)) if old else {}
+        shared = load_agents(session=False)
+        own = last.get("agents") if isinstance(last.get("agents"), dict) else None
+        # as _session_agents shows it: global router levels the session never saved still reach it
+        base = shared if own is None else {**own, **{n: a for n, a in shared.items() if n in ROUTER_LEVELS and n not in own}}
+        pending = entry["pending"]
+        try:
+            agents, off, router = overridden_agents(json.loads(json.dumps(base)), last, pending.get("subagent"),
+                                                    pending.get("levels"))
+        except SystemExit:  # the resumed session cannot take them: it keeps its own picks
+            agents, off, router = base, last.get("off"), last.get("router")
+        check_agents(agents)
+        data[launch] = {"agents": agents, **({"off": True} if off else {}),
+                        **({"router": router} if router is not None else {}), "sessions": [sid], "at": time.time()}
+        write_json(SESSION_AGENTS_FILE, data, indent=1)
+        sync_agents()
+        return
     if kept(entry):
         if sid in entry.setdefault("sessions", []):
             return
@@ -3698,6 +4381,13 @@ def hook_context(data):
 def main():
     global _STARTUP_LAUNCH
     args = sys.argv[1:]
+    if args[:1] == ["harness-auto"] and len(args) == 2:  # a harness's PreToolUse hook: JSON in, JSON out
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            payload = {}
+        print(json.dumps(harness_auto(args[1], payload if isinstance(payload, dict) else {})))
+        return
     if args[:1] in (["hook-agent"], ["hook-context"], ["hook-command"], ["hook-review"]):
         try:
             data = json.load(sys.stdin)
@@ -3798,6 +4488,13 @@ def main():
     for f in (APPLY_FILE,):
         if os.path.exists(f):
             os.remove(f)
+    cut = args.index("--") if "--" in args else len(args)
+    head = args[:cut]
+    harness = take_option(head, "--harness")  # ccx's own; Claude Code has none
+    args = head + args[cut:]
+    if harness is not None and harness.lower() not in HARNESSES:
+        die(f"Unknown harness '{harness}'. Valid: {', '.join(HARNESSES)}.")
+    harness = (harness or "claude").lower()
     no_run, pos = False, []
     while args:
         if args[0].lower() in ("-norun", "--norun"):
@@ -3809,8 +4506,31 @@ def main():
         else:
             pos.append(args.pop(0))
     claude_args = args[1:] if args[:1] == ["--"] else args
-    autocompact = take_option(claude_args, "--autocompact")  # ccx's own, not Claude's
+    # ccx's own, not Claude's; another harness gets every word after an opening `--`
+    autocompact = None if harness != "claude" and args[:1] == ["--"] else take_option(claude_args, "--autocompact")
     autocompact = None if autocompact is None else parse_pct(autocompact)
+    overrides, fallback_flag = {}, None
+    verbatim = args[:1] == ["--"]  # every word after an opening `--` is the client's
+    if not verbatim and pos != ["plain"]:  # after `--`, and on plain `claude`, every word is Claude's
+        cut = claude_args.index("--") if "--" in claude_args else len(claude_args)
+        head = claude_args[:cut]
+        overrides, fallback_flag = launch_overrides(head)  # one per part besides the main model
+        claude_args = head + claude_args[cut:]
+    if harness != "claude":
+        if len(pos) != 2 or no_run:
+            die(f"Usage: ccx --harness {harness} <provider> <model> [--effort E] [part flags] [-- {harness} arguments]")
+        name = pos[0].lower()
+        if name not in PROVIDERS:
+            die(f"Unknown provider '{name}'. Valid: {', '.join(sorted(PROVIDERS))}")
+        if autocompact is not None:
+            die("--autocompact sets Claude Code's compaction; other harnesses keep their own.")
+        cut = 0 if verbatim else claude_args.index("--") if "--" in claude_args else len(claude_args)
+        head = claude_args[:cut]
+        effort = take_option(head, "--effort")
+        if effort is not None and effort.lower() not in EFFORTS:
+            die(f"--effort must be one of {', '.join(EFFORTS)}.")
+        return launch_harness(harness, name, pos[1], effort and effort.lower(), overrides, fallback_flag,
+                              head + claude_args[cut + (0 if verbatim else 1):])
     if no_run and claude_args:
         die("-NoRun cannot be combined with Claude launch arguments.")
     if not pos and claude_args in (["--help"], ["-h"]):
@@ -3820,6 +4540,9 @@ def main():
         print("    [--effort E|default] [--autocompact N|default] [--description D] | ccx agents models <name> [provider]")
         print("    | ccx agents remove <name> | ccx agents router [on|off|best [provider]|ranges [easy-top mid-top]]")
         print("ccx agent <name> [same options, this run only] [task, else stdin]")
+        print(LAUNCH_FLAG_USAGE)
+        print("ccx presets set <provider|name> main|subagent|level|ranges|fallback|auto|tools ... (one part of a preset; "
+              "`ccx presets help` lists them)")
         print("Every launch, resume included, asks for the provider and model unless both are given.")
         return
 
@@ -3869,9 +4592,9 @@ def main():
         launch = _STARTUP_LAUNCH = uuid.uuid4().hex
         os.environ["CCX_LAUNCH_ID"] = launch  # the startup subagent prompt edits this launch only
         fallback, backing = None, False
-        if menus:
+        if menus and fallback_flag is None:
             steps.append("fallback")
-        if menus:
+        if menus and not ({"subagent", "levels"} & set(overrides)):
             steps.append("subagent")
         subagent_navigation = {}
         step = 0
@@ -3928,9 +4651,17 @@ def main():
         print("No change.")  # a cancel is not a failure: the PowerShell wrapper must not throw
         return
 
-    if not menus and fallback is None and name in FALLBACK_ROUTES:
+    if fallback_flag is not None:
+        if fallback_flag != "off" and fallback_flag["provider"] == name:
+            die("--fallback needs another provider than the main one.")
+        if fallback_flag != "off" and name not in FALLBACK_ROUTES and name != "official":
+            die(f"{name} connects directly, so there is nothing to fall back from; "
+                f"--fallback works on adapter routes: {', '.join(FALLBACK_ROUTES)}, official.")
+        fallback = None if fallback_flag == "off" else fallback_flag
+    elif not menus and fallback is None and name in FALLBACK_ROUTES:
         fallback = preset_fallback(name)
-    apply(name, model_id, no_run, claude_args=claude_args, effort=effort, autocompact=autocompact, fallback=fallback)
+    apply(name, model_id, no_run, claude_args=claude_args, effort=effort, autocompact=autocompact, fallback=fallback,
+          **({"overrides": overrides} if overrides else {}))
 
 
 if __name__ == "__main__":

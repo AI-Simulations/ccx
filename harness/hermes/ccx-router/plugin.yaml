@@ -1,0 +1,5 @@
+name: ccx-router
+version: 1.0.0
+description: "ccx's difficulty router: every delegate_task subagent names a difficulty, and ccx runs it on that level's model."
+author: ccx
+kind: backend

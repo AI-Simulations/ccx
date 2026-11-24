@@ -561,6 +561,43 @@ try:
         assert received[-1][:2] == ('/v1/messages', 'Bearer go-key')
         assert 'diagnostics' not in received[-1][2], 'first-party diagnostics never reach a third-party provider'
     proxy.route_for = route_for
+    # Other harnesses (pi, Hermes) name their launch in the path and each part by a placeholder model:
+    # ccx-main (or any other name) is the main model, ccx-auto/ccx-tools the helpers, ccx-live-<p> a profile.
+    nv = {"provider": "nvidia", "model": "main-m", "effort": "high", "key": "nv-key", "format": "chat"}
+    proxy.route_for = lambda launch: dict(nv) if launch == "H1" else None
+    helper_target, live_target = proxy.helper_target, proxy.live_target
+    proxy.helper_target = lambda launch, kind, current: {**current, "model": kind + "-m", "effort": "low"}
+    proxy.live_target = lambda model, launch: ({**nv, "model": "easy-m", "effort": None}
+                                               if model == "ccx-live-easy" and launch == "H1" else live_target(model, launch))
+    harness = f"http://127.0.0.1:{adapter.server_port}/ccx/H1/v1/messages"
+    classifier = {**check, "model": "ccx-main"}  # a Claude-shaped helper is still the main model here
+    for model, expect, effort in (("ccx-main", "main-m", "high"), ("whatever", "main-m", "high"), ("ccx-auto", "auto-m", "low"),
+                                  ("ccx-tools", "tools-m", "low"), ("ccx-live-easy", "easy-m", None)):
+        for sent in ({**body, "model": model, "stream": False}, *([classifier] if model == "ccx-main" else [])):
+            request = urllib.request.Request(harness, data=json.dumps(sent).encode(), headers={"x-api-key": "ccx-local"})
+            assert json.loads(urllib.request.urlopen(request, timeout=10).read())["content"][0]["text"] == "Ready"
+            assert received[-1][:2] == ("/v1/chat/completions", "Bearer nv-key"), received[-1][:2]
+            assert received[-1][2]["model"] == expect and received[-1][2].get("reasoning_effort") == effort, (model, received[-1][2])
+            if model in ("ccx-auto", "ccx-tools"):  # helpers get room to think before they answer, as Claude Code's do
+                sent_max = received[-1][2].get("max_tokens") or received[-1][2].get("max_completion_tokens") or 0
+                assert sent_max >= 4096, received[-1][2]
+    for path, code in (("/ccx/NOPE/v1/messages", 400), ("/ccx/bad..id/v1/messages", 404), ("/ccx/H1/v1/other", 404)):
+        request = urllib.request.Request(f"http://127.0.0.1:{adapter.server_port}{path}", data=json.dumps({**body, "stream": False}).encode())
+        try:
+            urllib.request.urlopen(request, timeout=10)
+        except urllib.error.HTTPError as exc:
+            assert exc.code == code, (path, exc.code)
+        else:
+            raise AssertionError(path)
+    proxy.route_for = lambda launch: {"provider": "official", "model": "claude-x", "effort": None, "key": "", "format": "official"}
+    request = urllib.request.Request(harness, data=json.dumps({**body, "stream": False}).encode())
+    try:
+        urllib.request.urlopen(request, timeout=10)
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 400 and "Claude Code" in json.load(exc)["error"]["message"]
+    else:
+        raise AssertionError("an official part outside Claude Code")
+    proxy.route_for, proxy.helper_target, proxy.live_target = route_for, helper_target, live_target
     # ...nor do the betas Claude Code adds only for Anthropic's own API; shared ones remain.
     assert proxy.third_party_beta('claude-code-20250219,prompt-caching-scope-2026-01-05,tool-provenance-2026-10-26,'
                                   'context-management-2025-06-27,thinking-binding-controls-2026-08-01,cache-diagnosis-2026-04-07,'

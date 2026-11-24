@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parent
 FILES = ('ccx-switch.py', 'ccx-switch.ps1', 'ccx-anthropic-proxy.py', 'opencode_key.py', 'patch-oauth-quota.py',
          'oauth-errors.mjs', 'test_ccx_switch.py', 'test_ccx_resume.py', 'test_ccx_proxy.py',
          'statusline.py', 'test_statusline.py', 'critic_mock_check.py', 'install-resume.py', 'README.md',
-         'ccx-gui.py', 'test_ccx_gui.py', 'ccx.ico')
+         'ccx-gui.py', 'test_ccx_gui.py', 'ccx.ico', 'test_ccx_harness.py')
+# What ccx ships for other harnesses (`ccx --harness ...`): the pi extension, the Hermes router plugin.
+HARNESS = 'harness'
 # Claude Code slash commands shipped with ccx.
 COMMAND_FILES = ('fallback.md',)
 # The /model picker mod, loaded through CLAUDE_CODE_PLUGIN_DIRS.
@@ -96,6 +98,8 @@ def install(target, profiles, commands=None, claude=None):
             assert destination.read_bytes() == (ROOT / 'commands' / name).read_bytes(), name
     if (ROOT / PLUGIN).is_dir():
         copy_tree(ROOT / PLUGIN, target / PLUGIN, backup)
+    if (ROOT / HARNESS).is_dir():
+        copy_tree(ROOT / HARNESS, target / HARNESS, backup)
     if settings is not None:
         claude.mkdir(parents=True, exist_ok=True)
         saved = backup / 'claude'
